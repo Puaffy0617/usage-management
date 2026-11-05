@@ -1,0 +1,120 @@
+name: Validate customized upstream update
+
+on:
+  schedule:
+    - cron: "23 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: "Official stable x.y.z version; leave blank for latest"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    if: github.repository == 'Puaffy0617/usage-management' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    outputs:
+      available: ${{ steps.release.outputs.available }}
+      target: ${{ steps.release.outputs.target }}
+      hosted: ${{ steps.release.outputs.hosted }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - name: Resolve newer official source release
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.target_version }}
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs/promises';
+          import { isNewerVersion } from './scripts/maintain-upstream.mjs';
+          import { validatePin, assertCustomVersion } from './scripts/hosted-release-lib.mjs';
+          const manifest = JSON.parse(await fs.readFile('customization/upstream.json', 'utf8'));
+          const pin = JSON.parse(await fs.readFile('customization/release-channel.json', 'utf8'));
+          if (pin.enabled) validatePin(pin);
+          let target = process.env.REQUESTED_VERSION?.trim();
+          if (!target) {
+            const response = await fetch('https://api.github.com/repos/farion1231/cc-switch/releases/latest', {headers:{Accept:'application/vnd.github+json','User-Agent':'cc-switch-unified-usage-maintenance'},redirect:'error',signal:AbortSignal.timeout(20000)});
+            if (!response.ok) throw new Error(`Official source lookup failed: ${response.status}`);
+            const release = await response.json();
+            if (release.draft || release.prerelease) throw new Error('Expected stable upstream release');
+            target = String(release.tag_name).replace(/^v/, '');
+          }
+          if (!/^\d+\.\d+\.\d+$/.test(target)) throw new Error('Expected stable x.y.z version');
+          let baseline = manifest.upstreamVersion;
+          if (pin.enabled) {
+            const published = await fetch(`https://api.github.com/repos/${pin.repository}/releases/latest`, {headers:{Accept:'application/vnd.github+json','User-Agent':'cc-switch-unified-usage-maintenance'},redirect:'error',signal:AbortSignal.timeout(20000)});
+            if (published.status !== 404) {
+              if (!published.ok) throw new Error(`Custom release lookup failed: ${published.status}`);
+              const release = await published.json();
+              const customVersion = assertCustomVersion(String(release.tag_name).replace(/^v/, ''));
+              const publishedUpstream = customVersion.split('-usage.')[0];
+              if (isNewerVersion(publishedUpstream, baseline)) baseline = publishedUpstream;
+            }
+          }
+          const available = isNewerVersion(target, baseline);
+          await fs.appendFile(process.env.GITHUB_OUTPUT, `available=${available}\ntarget=${target}\nhosted=${pin.enabled === true}\n`);
+          console.log(available ? `Preparing customized ${target}` : 'No newer upstream source release');
+          JS
+
+  candidate:
+    needs: detect
+    if: github.repository == 'Puaffy0617/usage-management' && needs.detect.outputs.available == 'true' && needs.detect.outputs.hosted != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      TARGET_VERSION: ${{ needs.detect.outputs.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - run: corepack enable
+      - name: Reapply customization, test and build candidate
+        run: node scripts/maintain-upstream.mjs --target-version $env:TARGET_VERSION --output "$env:RUNNER_TEMP/cc-switch-update-candidate" --build
+      - name: Upload candidate artifacts and result
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cc-switch-unified-usage-${{ needs.detect.outputs.target }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/cc-switch-update-candidate/result.json
+            ${{ runner.temp }}/cc-switch-update-candidate/CC-Switch-Unified-Usage-*-source.zip
+            ${{ runner.temp }}/cc-switch-update-candidate/CC-Switch-Unified-Usage-*-Windows-*.zip
+
+  hosted:
+    needs: detect
+    if: github.repository == 'Puaffy0617/usage-management' && needs.detect.outputs.available == 'true' && needs.detect.outputs.hosted == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/unified-hosted-release.yml
+    with:
+      upstream_version: ${{ needs.detect.outputs.target }}
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      CC_SWITCH_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.CC_SWITCH_GOOGLE_OAUTH_CLIENT_ID }}
+      CC_SWITCH_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.CC_SWITCH_GOOGLE_OAUTH_CLIENT_SECRET }}
+# Nothing is signed unless source integration, migration gates, tests and a
+# real Windows installer build pass in the reusable secret-free build job.

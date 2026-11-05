@@ -1,0 +1,62 @@
+# Unified account usage: source compatibility and feasibility
+
+Research date: 2026-11-05. This is a capability assessment, not a claim that a particular user's account has returned every optional field. No real account credentials were supplied during development.
+
+## Confirmed official account source
+
+The documented [Codex app-server account API](https://learn.chatgpt.com/docs/app-server#account-endpoints) exposes `account/usage/read`: nullable summary metrics and optional daily token buckets. `account/rateLimits/read` provides named quota windows, utilization and resets. `account/read` provides available email and plan metadata. These are service responses rather than measurements of this computer's requests. API-key-only authentication cannot use the account token-activity endpoint.
+
+The documented response does not provide model, feature or device attribution for these daily buckets, nor establish coverage of every consumer ChatGPT feature. Consequently this feature labels them **official account token activity; product coverage unspecified**. It never labels them complete ChatGPT usage.
+
+## Compatibility matrix
+
+| Source or client | Supported access | Available information | History | Cross-device interpretation | Authentication and limitations |
+| --- | --- | --- | --- | --- | --- |
+| Account token activity | Official app-server | Above account metrics | Daily buckets when returned; retention unspecified | Server-reported account data, independent of local log scanning | Separate managed ChatGPT login per analytics profile; current Codex installation required |
+| ChatGPT Web | No separate documented consumer usage feed established | See account source; per-web activity attribution unconfirmed | No complete feature ledger established | Do not assign all account buckets to Web | Do not scrape account pages |
+| ChatGPT Windows desktop | Profile has usage insights in [official settings documentation](https://learn.chatgpt.com/docs/app/settings#profile) | Activity insights are visible in the product | Product-specific availability | Profile display alone is not a new export/API contract | No desktop database scraping |
+| ChatGPT macOS desktop | Same research boundary as Windows | Profile insights; separate device attribution unconfirmed | Unconfirmed | No claim of macOS-only consumption | No keychain extraction |
+| ChatGPT iOS | No separate documented usage collector established | Feature-specific usage unconfirmed | Unconfirmed | Phone activity is not assumed absent or measured locally | No mobile scraping or credentials extraction |
+| ChatGPT Android | Same research boundary as iOS | Feature-specific usage unconfirmed | Unconfirmed | No Android-only estimate | No mobile scraping or credentials extraction |
+| Codex CLI / desktop / supported IDE | Account source plus existing CC Switch local session parser | Account metrics separately from recorded local tokens | Available account buckets; existing local session files | Same account may span clients; local files only cover those files | Existing session parser is local, not an account-completeness signal |
+| Other Codex interfaces | Account source where supported | Do not infer a platform breakdown | Only supplied history | Same account identity, uncertain product coverage | Unsupported clients do not become invented sources |
+| CC Switch proxy | Existing project instrumentation | Observed requests, reported tokens and configured cost calculation | Persisted local records | Only traffic observed by this proxy | Preserved existing behavior; no consumer account claims |
+| Imported analytics records | Explicit user-selected files | Validated metadata only | Whatever the file actually contains | Provenance must be preserved | An import does not verify the supplier's accuracy |
+| ChatGPT consumer data export | No supported token-ledger schema established in reviewed OpenAI Docs | Do not promise hidden token counts, reasoning counts or quota | Any content-derived history would be incomplete | Manual snapshot does not establish usage coverage | Export schema/feature coverage require a real user-provided export and further validation |
+| Eligible ChatGPT workspace Analytics API | [Official API overview](https://learn.chatgpt.com/docs/enterprise/analytics-api) | Unified daily ChatGPT, Codex and Work aggregates for enabled workspaces | Subject to entitled API contract | Workspace-level reporting | Requires workspace Admin key with `enterprise.analytics.usage.read`; personal Pro eligibility must not be assumed; authenticated API schema was not available for this implementation |
+| Compliance API | [Official administration documentation](https://learn.chatgpt.com/docs/enterprise/compliance-api) | Auditable records for authorized organizational workflows | Contract-dependent | Workspace/product scoped | Enterprise administration boundary; not a consumer usage substitute and not integrated here |
+| OpenAI Platform organization Usage API | [Official usage reference](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/completions) | API tokens/requests, time buckets and supported grouping | Time-range query and pagination | Organization API activity across callers | Separate [admin API key](https://developers.openai.com/api/reference/cli#admin-requests); this is API consumption, not evidence of ChatGPT subscription usage; not integrated here |
+
+## Models and features
+
+Model labels are stored only when the source actually supplies them. GPT-6 is neither hardcoded as the user's model nor inferred from plan membership. Reasoning mode cannot be reconstructed from an unsegmented account total. Images, uploads, document analysis, data analysis, voice and other tools remain unavailable as separate consumer metrics unless an authorized source explicitly reports them. A request count, image count, audio duration, credit balance and token count retain their own units. Quota utilization is a snapshot rather than consumed tokens.
+
+## Security and supported authorization
+
+Existing CC Switch ChatGPT accounts can be imported as nonsecret analytics links. The original account manager remains the only refresh-token owner. Import itself reads public account metadata without network access, token refresh or logout. On a subsequent explicit or configured synchronization, its normal credential lifecycle supplies a short-lived access token to the [documented experimental external-token flow](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens). The App Server uses ephemeral credential storage for this flow. Refresh tokens and ID tokens are not copied to a second profile. Unlinking/removing these analytics entries does not remove or sign out the original accounts. An expired original session may still require reauthorization through the existing Accounts page; no import can make an expired authorization valid.
+
+The [official authentication guide](https://learn.chatgpt.com/docs/auth#credential-storage) supports `cli_auth_credentials_store = "keyring"`, which fails when secure storage is unavailable. `auto` may fall back to plaintext and is unsuitable for separately authorized analytics profiles. Those profiles use an isolated `CODEX_HOME` and require keyring storage; imported links instead retain the original manager's storage and supply only ephemeral access tokens to the bridge. The analytics database stores no tokens, password or conversation body. Browser cookies and private usage endpoints are excluded.
+
+Do not treat a workspace identifier as a unique person: two users can belong to one workspace. Accounts without a stable supplied identity must not be silently merged. Reconnecting a profile must verify its known identity before attaching newly fetched usage.
+
+Credential isolation was also checked against the official Codex source at tag `rust-v0.166.0`, commit `6ff1e1ca3b30fc8b914720681fcf5fe62e95f856`: [auth storage implementation](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/login/src/auth/storage.rs#L285-L300). Its direct keyring backend derives the credential-store key from the canonical `CODEX_HOME` path. Its encrypted secrets backend is also created with that home and a dedicated authentication namespace. Distinct profile directories therefore separate stored logins in this verified version. The profile directory must exist before login and retain its canonical path afterwards; copying or moving metadata does not move its OS credentials. Reauthorization is required on a different machine.
+
+Before beginning authorization, the adapter writes an empty, nonsecret login-attempt marker in that isolated profile. Browser completion can store credentials before the application has bound an account identity. The marker survives failed or cancelled sign-ins and is cleared only by successful official logout. Removal must retry secure credential cleanup when this marker exists; a failed logout must not silently delete the account record or claim its credential entry was removed.
+
+## Existing CC Switch architecture investigated
+
+The upstream checkout is CC Switch 4.0.25: React 18, TypeScript, Vite, Tailwind 3, TanStack Query and Recharts, with a Tauri 2 Rust backend. `src/components/usage/UsagePage.tsx` wraps the existing dashboard. Commands in `src-tauri/src/commands/usage.rs` delegate to services and SQLite methods. `src-tauri/src/services/session_usage_codex.rs` scans local rollout files, computes usage deltas and writes `proxy_request_logs`; `session_usage.rs` coordinates client parsers. Daily rollups and session deduplication already exist in `database/schema.rs`. `lib.rs` registers commands and the session synchronization loop.
+
+Existing provider authentication and switching are separate from new analytics authorization. In particular, legacy `commands/codex_oauth.rs` and subscription quota services use private upstream routes; the new account analytics collector must not call those routes. Preserving the upstream functionality does not imply endorsing its private routes as new analytics sources.
+
+## Integrity decisions
+
+- Account daily totals and local event totals can overlap. Display separate series; never add them as if disjoint.
+- A lifetime snapshot is not another day's usage. Preserve it separately from daily buckets.
+- Upsert daily records by account, source, metric and supplied date. Repeated synchronization replaces that bucket's value, allowing upstream corrections, rather than appending another copy.
+- A missing field is unavailable. An explicit zero is a measured zero. An absent day is a gap unless the source defines it otherwise.
+- Preserve returned historical records across refreshes; a shorter later response is not proof older usage disappeared.
+- Quota windows belong to individual accounts and metered limits. Do not sum percentages across accounts.
+- Isolate failures per profile and keep successful history available after a network failure or expired login. Refresh only on user action or the configured interval while the application is active.
+
+Complete cross-platform, per-feature consumer history cannot be claimed from the reviewed contracts. The implementation can aggregate the official account metrics actually returned, preserve their limits, and supplement them with explicitly separate local/imported measurements.
