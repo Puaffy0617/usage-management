@@ -5,6 +5,35 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 
 export const EDITION = "cc-switch-unified-usage";
 export const PIN_FILE = "customization/release-channel.json";
+const SIGNING_FAILURE =
+  "Trusted installer signing failed; verify the protected key/password";
+
+export function commandFailure(
+  program,
+  args,
+  result,
+  { env = {}, signing = false } = {},
+) {
+  if (signing) return SIGNING_FAILURE;
+  const redact = (value) => {
+    let text = String(value ?? "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    const secrets = Object.entries(env)
+      .filter(
+        ([name, secret]) =>
+          /PRIVATE_KEY|PASSWORD|TOKEN|SECRET|API_KEY|GOOGLE_OAUTH_CLIENT_ID/i.test(
+            name,
+          ) &&
+          typeof secret === "string" &&
+          secret.length >= 4,
+      )
+      .map(([, secret]) => secret)
+      .sort((left, right) => right.length - left.length);
+    for (const secret of secrets) text = text.replaceAll(secret, "[REDACTED]");
+    return text;
+  };
+  const status = result.status ?? result.signal ?? "unavailable";
+  return `${program} ${args[0] ?? ""} failed (exit ${status}). ${redact(result.error?.message)}\n[stdout summary]\n${redact(result.stdout).slice(-8000)}\n[stderr tail]\n${redact(result.stderr).slice(-12000)}`;
+}
 export const CUSTOM_VERSION =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-usage\.([1-9]\d*)$/;
 const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;

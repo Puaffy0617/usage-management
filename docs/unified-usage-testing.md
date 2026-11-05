@@ -28,6 +28,8 @@ The signed-out smoke sent `initialize`, `initialized`, then `account/read` to th
 
 ## Reproducible checks
 
+The separate hosted-signing and release-bootstrap suites passed 15 Node tests (ten signing/workflow fixtures and five bootstrap tests), in addition to the 11 maintenance Git fixtures. The newly added native Google OAuth configuration test compiled locally, but the full GNU Tauri test executable could not start because of a Windows loader entry-point error; the MSVC hosted pipeline runs that exact test as a required gate.
+
 Use the repository-pinned pnpm version. The development machine's pnpm shim attempted to migrate build-script policy, so validation invoked the installed binaries directly after restoring the upstream workspace configuration:
 
 ```powershell

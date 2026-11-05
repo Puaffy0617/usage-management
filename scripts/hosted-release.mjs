@@ -17,6 +17,7 @@ import {
   makeManifest,
   verifyVersionedSignature,
   isNewerCustomVersion,
+  commandFailure,
 } from "./hosted-release-lib.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -38,11 +39,7 @@ function run(
     maxBuffer: 64 * 1024 * 1024,
   });
   if (!allowFailure && (result.error || result.status !== 0))
-    throw new Error(
-      signing
-        ? "Trusted installer signing failed; verify the protected key/password"
-        : `${program} ${args[0] ?? ""} failed: ${result.error?.message ?? result.stderr?.slice(-3000) ?? ""}`,
-    );
+    throw new Error(commandFailure(program, args, result, { env, signing }));
   return result;
 }
 

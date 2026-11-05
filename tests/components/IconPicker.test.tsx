@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { IconPicker } from "@/components/IconPicker";
@@ -106,7 +107,12 @@ describe("IconPicker my icons", () => {
     const onValueChange = vi.fn();
     renderPicker({ value: OTHER, onValueChange });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Relay A" }));
+    const library = within(
+      screen
+        .getByRole("heading", { name: "iconPicker.myIcons" })
+        .closest("section")!,
+    );
+    fireEvent.click(await library.findByRole("button", { name: "Relay A" }));
     expect(onValueChange).toHaveBeenCalledWith(CUSTOM);
     // 当前图标就在库里，不再单独显示「当前图标」
     expect(

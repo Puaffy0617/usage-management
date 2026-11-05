@@ -82,6 +82,7 @@
     "tests/components/DatabaseUpgrade.custom.test.tsx",
     "tests/components/HostedCustomUpdateNotice.test.tsx",
     "tests/components/HostedCustomUpdatePanel.test.tsx",
+    "tests/components/IconPicker.test.tsx",
     "tests/components/UnifiedUpdatePanel.test.tsx",
     "tests/components/UnifiedUsageDashboard.test.tsx",
     "tests/components/UpdateContext.custom.test.tsx",

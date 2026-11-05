@@ -24,10 +24,36 @@ import {
   normalizeHostedOverlay,
   advanceHostedCandidate,
   isNewerCustomVersion,
+  commandFailure,
 } from "../../scripts/hosted-release-lib.mjs";
 
 const VERSION = "4.0.25-usage.1";
 const COMMIT = "a".repeat(40);
+
+test("command failures retain bounded test evidence while signing failures remain generic", () => {
+  const secret = "fixture-sensitive-client-config";
+  const result = {
+    status: 1,
+    stdout:
+      "old output\n".repeat(1000) +
+      "\u001b[31mTest Files 1 failed | 281 passed\u001b[0m",
+    stderr:
+      "old diagnostic\n".repeat(1200) + `${secret}\nIconPicker.test.tsx:109:34`,
+    error: new Error(secret),
+  };
+  const diagnostic = commandFailure("corepack", ["pnpm"], result, {
+    env: { CC_SWITCH_GOOGLE_OAUTH_CLIENT_SECRET: secret },
+  });
+  assert.match(diagnostic, /Test Files 1 failed \| 281 passed/);
+  assert.match(diagnostic, /IconPicker\.test\.tsx:109:34/);
+  assert.doesNotMatch(diagnostic, /fixture-sensitive-client-config|\u001b/);
+  assert.ok(diagnostic.length < 21000);
+  assert.equal(
+    commandFailure("signer", [], result, { signing: true }),
+    "Trusted installer signing failed; verify the protected key/password",
+  );
+});
+
 function signingFixture() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const publicBytes = publicKey

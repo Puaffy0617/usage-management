@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   normalizeHostedOverlay,
   advanceHostedCandidate,
+  commandFailure,
 } from "./hosted-release-lib.mjs";
 
 export const OFFICIAL_REPOSITORY =
@@ -71,7 +72,7 @@ function run(program, args, options = {}) {
   if (!allowFailure && (result.error || result.status !== 0)) {
     throw new MaintenanceError(
       "error",
-      `${program} ${args[0] ?? ""} failed. ${result.error?.message ?? result.stderr?.slice(-4000) ?? ""}`,
+      commandFailure(program, args, result, { env: childEnv }),
     );
   }
   return result;
@@ -559,7 +560,11 @@ export async function verifyAndBuild(prepared, output, build) {
     ],
     ["dependencies", "corepack", ["pnpm", "install", "--frozen-lockfile"]],
     ["types", "corepack", ["pnpm", "typecheck"]],
-    ["frontend tests", "corepack", ["pnpm", "test:unit"]],
+    [
+      "frontend tests",
+      "corepack",
+      ["pnpm", "test:unit", "--maxWorkers=2", "--minWorkers=1"],
+    ],
     ["renderer", "corepack", ["pnpm", "build:renderer"]],
     [
       "analytics Rust tests",
