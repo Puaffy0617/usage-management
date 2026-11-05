@@ -212,7 +212,7 @@ fn numeric_metadata(value: &Value, keys: &[&str]) -> Option<Value> {
             if number.is_null()
                 || number
                     .as_f64()
-                    .is_some_and(|n| n.is_finite() && n >= 0.0 && n <= MAX_SAFE_VALUE)
+                    .is_some_and(|n| n.is_finite() && (0.0..=MAX_SAFE_VALUE).contains(&n))
             {
                 clean.insert((*key).to_owned(), number.clone());
             }
@@ -263,7 +263,7 @@ fn safe_limit(value: &Value) -> Option<Value> {
         if let Some(balance) = credits.get("balance").and_then(Value::as_str).filter(|s| {
             s.len() <= 64
                 && s.parse::<f64>()
-                    .is_ok_and(|n| n.is_finite() && n >= 0.0 && n <= MAX_SAFE_VALUE)
+                    .is_ok_and(|n| n.is_finite() && (0.0..=MAX_SAFE_VALUE).contains(&n))
         }) {
             allowed.insert("balance".into(), Value::String(balance.into()));
         }
@@ -1249,7 +1249,7 @@ pub fn chatgpt_export_observations(
                 missing += 1;
                 continue;
             };
-            if !timestamp.is_finite() || timestamp < 0.0 || timestamp > 253_402_300_799.0 {
+            if !timestamp.is_finite() || !(0.0..=253_402_300_799.0).contains(&timestamp) {
                 missing += 1;
                 continue;
             }

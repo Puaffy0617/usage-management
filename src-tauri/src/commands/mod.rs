@@ -37,12 +37,12 @@ mod subscription;
 mod sync_support;
 mod xai_oauth;
 
+mod custom_release;
 mod lightweight;
 mod s3_sync;
-mod usage;
-mod unified_usage;
 mod unified_updates;
-mod custom_release;
+mod unified_usage;
+mod usage;
 mod webdav_sync;
 mod workspace;
 
@@ -87,12 +87,12 @@ pub use stream_check::*;
 pub use subscription::*;
 pub use xai_oauth::*;
 
+pub use custom_release::*;
 pub use lightweight::*;
 pub use s3_sync::*;
-pub use usage::*;
-pub use unified_usage::*;
 pub use unified_updates::*;
-pub use custom_release::*;
+pub use unified_usage::*;
+pub use usage::*;
 pub use webdav_sync::*;
 pub use workspace::*;
 
