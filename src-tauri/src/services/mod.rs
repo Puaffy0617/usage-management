@@ -44,6 +44,8 @@ pub mod sync_protocol;
 pub mod unified_updates;
 pub mod unified_usage;
 pub mod unified_usage_codex;
+pub mod unified_usage_thread_store;
+pub mod unified_usage_threads;
 pub mod usage_cache;
 pub mod usage_stats;
 pub mod webdav;

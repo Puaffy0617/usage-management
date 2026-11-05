@@ -254,6 +254,7 @@ export async function validateBuildArtifact(
     "native Google OAuth configuration test",
     "native v25 migration test",
     "native v26 migration test",
+    "native v27 migration test",
     "nativeBuild",
   ];
   if (

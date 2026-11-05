@@ -5,6 +5,7 @@ import type {
   AnalyticsFilter,
   AnalyticsImportFormat,
   AnalyticsLogin,
+  ThreadUsageDashboard,
 } from "@/types/unifiedUsage";
 
 export const unifiedUsageApi = {
@@ -45,6 +46,8 @@ export const unifiedUsageApi = {
     ),
   dashboard: (filter: AnalyticsFilter) =>
     invoke<AnalyticsDashboard>("unified_usage_dashboard", { filter }),
+  threadDashboard: () =>
+    invoke<ThreadUsageDashboard>("unified_usage_thread_dashboard"),
   import: (accountId: string, path: string, format: AnalyticsImportFormat) =>
     invoke<{ imported: number; skipped: number; warnings: string[] }>(
       "unified_usage_import",

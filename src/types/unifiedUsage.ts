@@ -97,3 +97,40 @@ export type AnalyticsImportFormat =
   | "backup"
   | "chatgpt_export"
   | "observations";
+
+export interface ThreadUsageGroup {
+  model: string | null;
+  reasoningEffort: string | null;
+  speed: string | null;
+  estimatedUsageCreditsMicros: number;
+  netNewInputTokens: number | null;
+  cachedInputTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+}
+
+/** Official thread lifetime snapshot; it has no reported activity date. */
+export interface ThreadUsageSnapshot {
+  threadId: string;
+  day: null;
+  estimatedUsageCreditsMicros: number;
+  estimatedUsageUsdMicros: number | null;
+  nativeUsageUsdMicros: number | null;
+  groups: ThreadUsageGroup[];
+}
+
+export interface ThreadUsageRecord {
+  accountId: string;
+  threadId: string;
+  status: "available" | "unavailable" | "error";
+  checkedAt: number;
+  lastSuccessAt: number | null;
+  snapshot: ThreadUsageSnapshot | null;
+  error: string | null;
+}
+
+export interface ThreadUsageDashboard {
+  records: ThreadUsageRecord[];
+  candidateCount: number;
+}

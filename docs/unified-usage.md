@@ -18,6 +18,8 @@ See [the compatibility assessment](unified-usage-sources.md) for all requested p
 
 The v2 account view adds API-equivalent CNY estimates, measured-token/request/cache cards, a UTC daily heatmap and account/model/day tables. Costs require exact model prices and explicit compatible token components; unavailable amounts stay unavailable. See [the cost and automatic-refresh guide](unified-usage-costs.md) (Chinese). These estimates are not subscription charges.
 
+Revision `usage.3` fixes native focus initialization/resume and transient transport recovery, keeps successful sync timestamps visible, and adds separately scoped official cumulative thread snapshots. See [refresh and thread coverage](unified-usage-refresh.md). Thread snapshots are never added to the account daily series.
+
 ## Architecture and data integrity
 
 The frontend uses the application's React components, TanStack Query, design tokens and Recharts. `UsagePage.tsx` selects the existing device dashboard or the additive `UnifiedUsageDashboard.tsx`. `src/lib/api/unifiedUsage.ts` provides typed Tauri command calls.

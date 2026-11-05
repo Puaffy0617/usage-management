@@ -2,6 +2,12 @@
 
 Validation date: 2026-11-05. Upstream baseline: `ca58c0313360eae7c851fbd7553c1614c7af03e7`.
 
+## Revision usage.3 verification
+
+The new native focus/status and thread-panel checks passed 30 frontend tests; TypeScript and the production renderer passed. The exact production-source core harness passed 67 tests. A later unavailable-thread cooldown boundary change passed all four filtered store tests (64 other tests filtered); these counts overlap and are not additive. The 26 Node maintenance/signing/bootstrap tests passed with schema 27 included in the mandatory hosted migration gates. Isolated headless UI checks at 1800×1180 and 1280×900 verified persistent success/pause status, exact token totals, separate cumulative thread model/USD snapshots, cross-account ambiguity handling and all-account synchronization under an individual display filter, with no browser errors or external network requests. The screen fixtures are explicitly synthetic.
+
+Native tests cover bounded fresh-process transport recovery, authentication classification, partial-result preservation, three-ID request limits, per-thread request/collection budgets, missing and unsafe numeric fields, metadata-only candidate discovery, replacement/stale snapshots, cooldown/queue fairness, shared thread contexts, deletion isolation and additive schema 27 migration/backup fixtures. The normal CI and hosted release publish their actual complete check results. Runtime availability of the per-thread billing response for a particular real account still requires an actual response; protocol fixtures do not establish that availability.
+
 ## Results
 
 | Check                                                     | Result                                                                                                                                                                                                       |

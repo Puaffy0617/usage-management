@@ -2,12 +2,17 @@
 use crate::database::Database;
 use crate::error::AppError;
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthError;
+use crate::services::unified_usage_thread_store::{ThreadCheckResult, ThreadUsageDashboard};
+use crate::services::unified_usage_threads::{
+    discover_thread_candidates, parse_thread_usage, DiscoveryLimits, ThreadCandidate,
+};
 use crate::services::{unified_usage::*, unified_usage_codex as codex};
 use crate::store::AppState;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -252,35 +257,44 @@ pub struct SyncResult {
 }
 
 fn error_status(error: &str) -> &'static str {
-    let lower = error.to_lowercase();
-    if [
-        "expired",
-        "disconnected",
-        "browser sign-in",
-        "requires sign-in",
-        "unauthorized",
-        "not authenticated",
-        "sign in",
-        "401",
-        "403",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
-    {
-        "reauth_required"
-    } else if [
-        "method not found",
-        "not supported",
-        "unsupported",
-        "is unavailable in this codex version",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
-    {
-        "unsupported"
-    } else {
-        "error"
+    codex::error_connection_status(error)
+}
+
+async fn thread_candidates() -> Vec<ThreadCandidate> {
+    type DiscoveryCache = Option<(PathBuf, Instant, Vec<ThreadCandidate>)>;
+    static CACHE: OnceLock<Mutex<DiscoveryCache>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().await;
+    let root = crate::codex_config::get_codex_config_dir();
+    if let Some((cached_root, captured, candidates)) = cache.as_ref() {
+        if cached_root == &root && captured.elapsed() < Duration::from_secs(300) {
+            return candidates.clone();
+        }
     }
+    let scan_root = root.clone();
+    let scanned = tauri::async_runtime::spawn_blocking(move || {
+        let mut candidates = Vec::new();
+        for folder in ["sessions", "archived_sessions"] {
+            match discover_thread_candidates(&scan_root.join(folder), DiscoveryLimits::default()) {
+                Ok(discovery) => candidates.extend(discovery.candidates),
+                Err(_) => log::warn!(
+                    "Thread candidate discovery is incomplete; account activity remains available"
+                ),
+            }
+        }
+        candidates
+    })
+    .await;
+    let candidates = match scanned {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            log::warn!(
+                "Thread candidate discovery could not finish; account activity remains available"
+            );
+            Vec::new()
+        }
+    };
+    *cache = Some((root, Instant::now(), candidates.clone()));
+    candidates
 }
 
 #[tauri::command]
@@ -301,6 +315,11 @@ pub async fn unified_usage_sync(
     if account_id.is_some() && targets.is_empty() {
         return Err("Analytics account not found".into());
     }
+    let discovered_threads = if targets.is_empty() {
+        Vec::new()
+    } else {
+        thread_candidates().await
+    };
     let mut errors = Vec::new();
     // An individual failure cannot abort another account. Serialize each profile
     // so a slow automatic refresh cannot race a manual refresh or disconnect.
@@ -330,6 +349,27 @@ pub async fn unified_usage_sync(
             continue;
         }
         let id = target.id.clone();
+        let candidates = discovered_threads.clone();
+        let thread_ids = match db_task(&state, move |db| {
+            db.unified_usage_thread_select_targets(
+                &id,
+                &candidates,
+                3,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+        .await
+        {
+            Ok(candidates) => candidates
+                .into_iter()
+                .map(|candidate| candidate.thread_id)
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                log::warn!("Thread candidate selection is unavailable; account activity will still synchronize");
+                Vec::new()
+            }
+        };
+        let id = target.id.clone();
         let run = db_task(&state, move |db| {
             db.unified_usage_begin_sync(&id, "codex_app_server")
         })
@@ -344,10 +384,10 @@ pub async fn unified_usage_sync(
                     _=>format!("Cannot refresh the original CC Switch account: {error}"),
                 })?;
                 let workspace=manager.chatgpt_account_id_for_account(source_id).await.map_err(|_|"Linked account requires sign-in in the original CC Switch Accounts panel".to_owned())?;
-                codex::sync_external(&target.id,token,workspace).await
+                codex::sync_external(&target.id,token,workspace,&thread_ids).await
             }.await
         } else {
-            codex::sync(&target.id).await
+            codex::sync(&target.id, &thread_ids).await
         };
         let processed = match outcome {
             Ok(payload) => {
@@ -355,12 +395,29 @@ pub async fn unified_usage_sync(
                 db_task(&state,move|db|{
                     let account=payload.get("account").filter(|v|!v.is_null()).ok_or_else(||AppError::InvalidInput("Codex did not report the authenticated account".into()))?;
                     db.unified_usage_bind_identity(&id,account)?;
+                    let checks=payload.get("threadChecks").and_then(Value::as_array).into_iter().flatten().filter_map(|check| {
+                        let thread_id=check.get("threadId").and_then(Value::as_str)?.to_owned();
+                        let (snapshot,error)=if let Some(error)=check.get("error").and_then(Value::as_str) {
+                            (None,(!codex::thread_error_is_unavailable(error)).then(||error.to_owned()))
+                        } else if let Some(response)=check.get("response").filter(|value|!value.is_null()) {
+                            match parse_thread_usage(&thread_id,response) {
+                                Ok(snapshot)=>(snapshot,None),
+                                Err(error)=>(None,Some(error)),
+                            }
+                        } else {(None,None)};
+                        Some(ThreadCheckResult{thread_id,snapshot,error})
+                    }).collect::<Vec<_>>();
+                    let verified_thread_data_available=checks.iter().any(|check|check.snapshot.is_some());
+                    let thread_data_saved=db.unified_usage_thread_apply_results(&id,&checks,chrono::Utc::now().timestamp_millis()).is_ok();
+                    if !thread_data_saved {
+                        log::warn!("Thread snapshots could not be saved; account activity remains available");
+                    }
                     let usage=payload.get("usage").filter(|v|!v.is_null());
                     let quota=payload.get("rateLimits").filter(|v|!v.is_null());
                     let warnings=payload.get("errors").and_then(Value::as_array).map(|items|items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default();
-                    if usage.is_none() && quota.is_none() {return Err(AppError::Message(if warnings.is_empty(){"The installed Codex service did not return supported usage or rate-limit data".into()}else{warnings}));}
+                    let status=codex::sync_connection_status(usage.is_some()||quota.is_some(),verified_thread_data_available&&thread_data_saved,&warnings).map_err(AppError::Message)?;
                     let count=db.unified_usage_apply_official(&id,usage,quota)?;
-                    db.unified_usage_set_status(&id,"connected",(!warnings.is_empty()).then_some(warnings.as_str()))?;
+                    db.unified_usage_set_status(&id,status,(!warnings.is_empty()).then_some(warnings.as_str()))?;
                     Ok((count,warnings))
                 }).await
             }
@@ -406,6 +463,13 @@ pub async fn unified_usage_dashboard(
     filter: AnalyticsFilter,
 ) -> Result<AnalyticsDashboard, String> {
     db_task(&state, move |db| db.unified_usage_dashboard(&filter)).await
+}
+
+#[tauri::command]
+pub async fn unified_usage_thread_dashboard(
+    state: State<'_, AppState>,
+) -> Result<ThreadUsageDashboard, String> {
+    db_task(&state, Database::unified_usage_thread_dashboard).await
 }
 
 #[tauri::command]

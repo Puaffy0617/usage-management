@@ -643,6 +643,18 @@ export async function verifyAndBuild(prepared, output, build) {
         "--lib",
       ],
     ],
+    [
+      "native v27 migration test",
+      "cargo",
+      [
+        "test",
+        "--locked",
+        "--manifest-path",
+        "src-tauri/Cargo.toml",
+        "migration_v26_to_v27",
+        "--lib",
+      ],
+    ],
   ];
   if (build) {
     if (process.platform !== "win32" || !nativeTarget)

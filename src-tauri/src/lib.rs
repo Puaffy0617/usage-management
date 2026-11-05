@@ -1859,6 +1859,7 @@ pub fn run() {
             commands::unified_usage_cancel_login,
             commands::unified_usage_sync,
             commands::unified_usage_dashboard,
+            commands::unified_usage_thread_dashboard,
             commands::unified_usage_import,
             commands::unified_usage_export,
             commands::get_usage_summary,

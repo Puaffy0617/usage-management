@@ -5,6 +5,58 @@
 use super::*;
 
 #[test]
+fn migration_v26_to_v27_preserves_account_provider_and_daily_history() {
+    let temporary = tempfile::NamedTempFile::new().unwrap();
+    let conn = Connection::open(temporary.path()).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    conn.execute_batch(include_str!("unified_usage_v25.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("unified_usage_v26.sql"))
+        .unwrap();
+    conn.execute_batch("CREATE TABLE providers(id TEXT PRIMARY KEY,name TEXT); INSERT INTO providers VALUES('provider','Preserved provider'); INSERT INTO unified_usage_accounts(id,name,identity,created_at) VALUES('analytics','Retained account','fixture@example.com',1); INSERT INTO unified_usage_account_links VALUES('analytics','original-account'); PRAGMA user_version=26;").unwrap();
+    conn.execute_batch("INSERT INTO unified_usage_observations(id,account_id,source,scope,metric,unit,provenance,period_start,period_end,granularity,value,observed_at) VALUES('daily','analytics','fixture','fixture_scope','tokens','tokens','official','2026-11-04','2026-11-05','day',7,1);").unwrap();
+    // Snapshot a disposable v26 fixture before migration; the application's
+    // ordinary pre-migration backup remains unchanged and includes these rows.
+    let backup = tempfile::NamedTempFile::new().unwrap();
+    conn.execute("VACUUM INTO ?1", [backup.path().to_str().unwrap()])
+        .unwrap();
+    Database::apply_schema_migrations_on_conn(&conn).unwrap();
+    Database::apply_schema_migrations_on_conn(&conn).unwrap();
+    assert_eq!(Database::get_user_version(&conn).unwrap(), 27);
+    let preserved:(String,String,String)=conn.query_row("SELECT p.name,a.identity,l.provider_account_id FROM providers p,unified_usage_accounts a,unified_usage_account_links l WHERE a.id=l.account_id",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(
+        preserved,
+        (
+            "Preserved provider".into(),
+            "fixture@example.com".into(),
+            "original-account".into()
+        )
+    );
+    let retained_tokens: f64 = conn
+        .query_row(
+            "SELECT value FROM unified_usage_observations WHERE id='daily'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_tokens, 7.0);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM unified_usage_thread_records",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    let old = Connection::open(backup.path()).unwrap();
+    assert_eq!(Database::get_user_version(&old).unwrap(), 26);
+    let old_name: String = old
+        .query_row("SELECT name FROM providers", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(old_name, "Preserved provider");
+}
+
+#[test]
 fn migration_v24_to_v25_is_additive_and_idempotent() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE providers(id TEXT PRIMARY KEY,name TEXT); INSERT INTO providers VALUES ('existing','Preserved provider'); PRAGMA user_version=24;").unwrap();

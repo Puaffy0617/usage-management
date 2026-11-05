@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UnifiedUsageDashboard } from "@/components/usage/UnifiedUsageDashboard";
 import { unifiedUsageApi } from "@/lib/api/unifiedUsage";
 import { settingsApi } from "@/lib/api/settings";
+import { WINDOW_ACTIVITY_EVENT } from "@/lib/windowActivity";
 import type { ModelPricing } from "@/types/usage";
 import type {
   AnalyticsAccount,
@@ -23,6 +24,7 @@ vi.mock("@/lib/api/unifiedUsage", () => ({
     listAccounts: vi.fn(),
     importExistingAccounts: vi.fn(),
     dashboard: vi.fn(),
+    threadDashboard: vi.fn(),
     sync: vi.fn(),
     addAccount: vi.fn(),
     updateAccount: vi.fn(),
@@ -159,9 +161,13 @@ beforeEach(() => {
       usageBuckets: dashboard.usageBuckets ?? [...grouped.values()],
     };
   });
-  vi.mocked(unifiedUsageApi.sync).mockResolvedValue({
-    accounts: [],
+  vi.mocked(unifiedUsageApi.sync).mockImplementation(async () => ({
+    accounts,
     errors: [],
+  }));
+  vi.mocked(unifiedUsageApi.threadDashboard).mockResolvedValue({
+    records: [],
+    candidateCount: 0,
   });
 });
 
@@ -374,7 +380,7 @@ describe("Unified account analytics", () => {
     expect(unifiedUsageApi.disconnectAccount).not.toHaveBeenCalled();
   });
 
-  it("automatically refreshes both accounts by default, independently of account filters, only while visible and focused", async () => {
+  it("resumes both due accounts on native-only activity changes, independently of account filters, only while visible and focused", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     const now = Date.parse("2026-11-05T12:00:00Z");
     vi.setSystemTime(now);
@@ -387,6 +393,9 @@ describe("Unified account analytics", () => {
     const view = show();
     try {
       await screen.findByText("Account A", { selector: "button" });
+      expect(
+        screen.getByText("Automatic refresh paused: window inactive"),
+      ).toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("Account"), {
         target: { value: "A" },
       });
@@ -395,13 +404,19 @@ describe("Unified account analytics", () => {
       });
       expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
       document.documentElement.dataset.windowActive = "true";
-      fireEvent.focus(window);
+      fireEvent(
+        window,
+        new CustomEvent(WINDOW_ACTIVITY_EVENT, { detail: { active: true } }),
+      );
       await waitFor(() =>
         expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(2),
       );
       expect(
         vi.mocked(unifiedUsageApi.sync).mock.calls.map(([id]) => id),
       ).toEqual(["A", "B"]);
+      expect(
+        screen.getByText("Automatic refresh on · Every 2 minutes"),
+      ).toBeInTheDocument();
       document.documentElement.dataset.windowActive = "false";
       await act(async () => {
         await vi.advanceTimersByTimeAsync(240000);
@@ -725,6 +740,62 @@ describe("Unified account analytics", () => {
     await waitFor(() => expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(1));
     expect(unifiedUsageApi.sync).toHaveBeenCalledWith(undefined);
     expect(unifiedUsageApi.sync).not.toHaveBeenCalledWith("A");
+  });
+
+  it("shows an authoritative successful check with unchanged tokens even if the following metadata refetch fails", async () => {
+    localStorage.setItem("cc-switch.unified-usage.autoRefresh", "0");
+    const checkedAt = Date.parse("2026-11-05T12:34:56Z");
+    accounts = [
+      { ...makeAccount("A"), lastSyncAt: checkedAt - 600000 },
+      { ...makeAccount("B"), lastSyncAt: checkedAt - 600000 },
+    ];
+    dashboard.accounts = accounts;
+    dashboard.totals = [metric("A", 5_560_000_012)];
+    vi.mocked(unifiedUsageApi.listAccounts)
+      .mockResolvedValueOnce(accounts)
+      .mockRejectedValue(new Error("Metadata refetch unavailable"));
+    vi.mocked(unifiedUsageApi.sync).mockResolvedValue({
+      accounts: accounts.map((account) => ({
+        ...account,
+        lastSyncAt: checkedAt,
+      })),
+      errors: [],
+    });
+    show();
+    await screen.findByRole("button", { name: "Measured tokens 5.56B" });
+    fireEvent.click(screen.getByRole("button", { name: "Sync now" }));
+    await waitFor(() =>
+      expect(unifiedUsageApi.listAccounts).toHaveBeenCalledTimes(2),
+    );
+    const status = screen.getByRole("status", {
+      name: "Synchronization status",
+    });
+    expect(
+      within(status).getByText(
+        `All-account last successful check: ${new Date(checkedAt).toLocaleString("zh")}`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(status).getByText("Exact reported tokens: 5,560,000,012"),
+    ).toHaveAttribute("title", "5,560,000,012");
+    expect(
+      within(status).getByText("Latest reported activity (UTC): 2026-11-05"),
+    ).toBeInTheDocument();
+    expect(
+      within(status).getByText(/Official token totals are available/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Requests —" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Cache hit rate —" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Estimated API equivalent —" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Metadata refetch unavailable", { exact: false }),
+    ).toBeInTheDocument();
   });
 
   it("retries transient account errors at the configured interval and isolates failures from other accounts", async () => {

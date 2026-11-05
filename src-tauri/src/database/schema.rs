@@ -23,6 +23,7 @@ impl Database {
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
         crate::services::unified_usage::create_schema(conn)?;
+        crate::services::unified_usage_thread_store::create_thread_schema(conn)?;
         // 1. Providers 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers (
@@ -656,6 +657,10 @@ impl Database {
                     25 => {
                         crate::services::unified_usage::create_link_schema(conn)?;
                         Self::set_user_version(conn, 26)?;
+                    }
+                    26 => {
+                        crate::services::unified_usage_thread_store::create_thread_schema(conn)?;
+                        Self::set_user_version(conn, 27)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(

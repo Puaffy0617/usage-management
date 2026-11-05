@@ -38,8 +38,10 @@ import {
   type UnifiedOverviewMetric,
 } from "./UnifiedUsageOverview";
 import { formatTokensCompact } from "./format";
+import { UnifiedThreadUsagePanel } from "./UnifiedThreadUsagePanel";
 import { useUnifiedUsagePricing } from "@/hooks/useUnifiedUsagePricing";
 import { estimateUnifiedUsageCosts } from "@/lib/unifiedUsageCost";
+import { WINDOW_ACTIVITY_EVENT } from "@/lib/windowActivity";
 import type {
   AnalyticsAccount,
   AnalyticsImportFormat,
@@ -68,6 +70,13 @@ const PROVENANCE_RANK = new Map([
   ["local", 1],
   ["estimated", 2],
 ]);
+
+function windowPauseReason() {
+  if (document.visibilityState === "hidden") return "hidden";
+  if (document.documentElement.dataset.windowActive === "false")
+    return "inactive";
+  return null;
+}
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -296,6 +305,7 @@ export function UnifiedUsageDashboard({
     }
   });
   const [busy, setBusy] = useState(false);
+  const [pauseReason, setPauseReason] = useState(windowPauseReason);
   const busyRef = useRef(false);
   const lastAutoAttemptAt = useRef(new Map<string, number>());
   const [error, setError] = useState<string | null>(null);
@@ -489,6 +499,7 @@ export function UnifiedUsageDashboard({
     for (const target of targets)
       lastAutoAttemptAt.current.set(target.id, Date.now());
     const result = await unifiedUsageApi.sync(id);
+    queryClient.setQueryData([...QUERY_KEY, "accounts"], result.accounts);
     if (result.errors.length) setError(result.errors.join("\n"));
   };
 
@@ -496,13 +507,9 @@ export function UnifiedUsageDashboard({
   // A timer is not a second collector and stops when the page is unmounted.
   useEffect(() => {
     const synchronizeDueAccounts = async () => {
-      if (
-        !autoRefresh ||
-        busyRef.current ||
-        document.visibilityState === "hidden" ||
-        document.documentElement.dataset.windowActive === "false"
-      )
-        return;
+      const paused = windowPauseReason();
+      setPauseReason(paused);
+      if (!autoRefresh || busyRef.current || paused !== null) return;
       const now = Date.now();
       const due = accounts.filter(
         (account) =>
@@ -534,11 +541,15 @@ export function UnifiedUsageDashboard({
     void synchronizeDueAccounts();
     const resume = () => void synchronizeDueAccounts();
     window.addEventListener("focus", resume);
+    window.addEventListener("blur", resume);
+    window.addEventListener(WINDOW_ACTIVITY_EVENT, resume);
     document.addEventListener("visibilitychange", resume);
     const timer = window.setInterval(resume, 60_000);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener("focus", resume);
+      window.removeEventListener("blur", resume);
+      window.removeEventListener(WINDOW_ACTIVITY_EVENT, resume);
       document.removeEventListener("visibilitychange", resume);
     };
     // Account metadata is refreshed after each synchronization, including failures.
@@ -837,6 +848,31 @@ export function UnifiedUsageDashboard({
     refreshableAccounts.every((account) => account.lastSyncAt !== null)
       ? Math.min(...refreshableAccounts.map((account) => account.lastSyncAt!))
       : 0;
+  const latestReportedDay = report.buckets
+    .map(({ bucket }) => bucket.day)
+    .filter((day): day is string => day !== null)
+    .sort()
+    .at(-1);
+  const frequency =
+    autoRefreshMs === 60000
+      ? tx("everyMinute", "Every minute")
+      : autoRefreshMs === 300000
+        ? tx("everyFiveMinutes", "Every 5 minutes")
+        : tx("everyTwoMinutes", "Every 2 minutes");
+  const autoRefreshStatus = !autoRefresh
+    ? tx("autoRefreshOff", "Automatic refresh off")
+    : pauseReason === "hidden"
+      ? tx("autoRefreshHidden", "Automatic refresh paused: page hidden")
+      : pauseReason === "inactive"
+        ? tx("autoRefreshInactive", "Automatic refresh paused: window inactive")
+        : `${tx("autoRefreshOn", "Automatic refresh on")} · ${frequency}`;
+  const officialTokenTotalsOnly =
+    families.find((family) => family.key === familyKey)?.provenance ===
+      "official" &&
+    report.total.measuredTokens !== null &&
+    report.total.requests === null &&
+    report.total.cacheHitRate === null &&
+    report.buckets.every(({ bucket }) => bucket.model === null);
   const prepareImport = () => {
     if (!accounts.length) setImportFormat("backup");
     setImportAccount(accountId || accounts[0]?.id || "");
@@ -963,6 +999,38 @@ export function UnifiedUsageDashboard({
             </option>
           ))}
         </select>
+      </div>
+      <div
+        role="status"
+        aria-label={tx("syncStatus", "Synchronization status")}
+        className="space-y-1 px-6 pb-2 text-caption text-fg-3"
+      >
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span>{autoRefreshStatus}</span>
+          <span>
+            {tx("refreshAccountCount", "Accounts eligible for refresh")}:{" "}
+            {refreshableAccounts.length}
+          </span>
+          <span>
+            {`${tx("allAccountsLastSuccess", "All-account last successful check")}: ${lastSyncAt ? formatAnalyticsTimestamp(lastSyncAt, locale) : tx("notAllChecked", "Not yet successful for all accounts")}`}
+          </span>
+          <span>
+            {`${tx("latestReportedDay", "Latest reported activity (UTC)")}: ${latestReportedDay ?? tx("notReported", "Not reported")}`}
+          </span>
+          {report.total.measuredTokens !== null && (
+            <span title={number(report.total.measuredTokens)}>
+              {`${tx("exactReportedTokens", "Exact reported tokens")}: ${number(report.total.measuredTokens)}`}
+            </span>
+          )}
+        </p>
+        {officialTokenTotalsOnly && (
+          <p>
+            {tx(
+              "officialTokenAvailability",
+              "Official token totals are available. Model, request and cache details are not reported; an API cost requires model and input/output details. Refreshing cannot create fields the source does not provide.",
+            )}
+          </p>
+        )}
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 pb-6 pt-1">
         {(error || queryError || importNotice) && (
@@ -1196,6 +1264,18 @@ export function UnifiedUsageDashboard({
                               {count(lifetime)} Tokens
                             </p>
                           )}
+                          {value?.measuredTokens !== null &&
+                            value?.measuredTokens !== undefined &&
+                            value.requests === null &&
+                            value.cacheHitRate === null &&
+                            value.cny === null && (
+                              <p className="mt-0.5 max-w-[260px] whitespace-normal text-caption text-fg-3">
+                                {tx(
+                                  "tokensOnlyAvailability",
+                                  "Tokens reported; other metrics unavailable",
+                                )}
+                              </p>
+                            )}
                         </td>
                         <td className="px-4 py-3 text-fg-2">
                           {account.subscription ?? "—"}
@@ -1203,7 +1283,15 @@ export function UnifiedUsageDashboard({
                         <td className="px-4 py-3 tabular-nums text-fg-2">
                           {count(value?.requests ?? null)}
                         </td>
-                        <td className="px-4 py-3 tabular-nums text-fg-1">
+                        <td
+                          className="px-4 py-3 tabular-nums text-fg-1"
+                          title={
+                            value?.measuredTokens !== null &&
+                            value?.measuredTokens !== undefined
+                              ? number(value.measuredTokens)
+                              : tx("notReported", "Not reported")
+                          }
+                        >
                           {count(value?.measuredTokens ?? null)}
                         </td>
                         <td className="px-4 py-3 tabular-nums text-fg-2">
@@ -1218,6 +1306,18 @@ export function UnifiedUsageDashboard({
                             account.lastSyncAt,
                             locale,
                           ) ?? "—"}
+                          <p
+                            className={cn(
+                              "mt-0.5",
+                              account.connectionStatus !== "connected" &&
+                                "text-warning-text",
+                            )}
+                          >
+                            {tx(
+                              `status_${account.connectionStatus}`,
+                              account.connectionStatus.replace(/_/g, " "),
+                            )}
+                          </p>
                           {account.lastError && (
                             <p className="mt-1 max-w-[250px] whitespace-normal text-warning-text">
                               {account.lastError}
@@ -1336,6 +1436,7 @@ export function UnifiedUsageDashboard({
             )}
           </div>
         </section>
+        <UnifiedThreadUsagePanel accounts={accounts} accountId={accountId} />
         <p className="text-caption text-fg-3">
           {tx(
             "compactCoverage",

@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -18,6 +19,189 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 const CREDENTIAL_MARKER: &str = ".cc-switch-login-attempted";
+const THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const THREAD_COLLECTION_BUDGET: Duration = Duration::from_secs(30);
+
+fn rpc_error(method: &str, error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+    if code == -32601 {
+        return format!("{method} is unavailable in this Codex version; upgrade the official CLI");
+    }
+    // Inspect recognized authentication markers, but never retain arbitrary
+    // server text: it may contain account details or authentication diagnostics.
+    let authentication = code == 401
+        || code == 403
+        || [
+            error.get("message"),
+            error.pointer("/data/type"),
+            error.pointer("/data/code"),
+            error.pointer("/data/error/type"),
+            error.pointer("/data/error/code"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|value| {
+            let value = value.to_ascii_lowercase();
+            [
+                "authentication_error",
+                "authentication_required",
+                "unauthorized",
+                "not authenticated",
+                "invalid_token",
+                "token_expired",
+            ]
+            .iter()
+            .any(|marker| value.contains(marker))
+        });
+    if authentication {
+        format!("Codex authentication required for {method} (RPC code {code})")
+    } else {
+        format!("Codex {method} failed (RPC code {code})")
+    }
+}
+
+/// Shared with command status handling so generic RPC failures do not become
+/// authentication failures merely because an error offers sign-in advice.
+pub fn error_connection_status(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if [
+        "codex authentication required",
+        "linked account requires sign-in",
+        "chatgpt account is disconnected",
+        "complete account sign-in",
+        "authentication_error",
+        "authentication_required",
+        "unauthorized",
+        "not authenticated",
+        "invalid_token",
+        "token_expired",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        "reauth_required"
+    } else if definite_transport_error(error) || lower.contains("failed (rpc code ") {
+        // A mixed result (for example unsupported usage plus a temporary quota
+        // failure) must keep retrying its supported component on later refresh.
+        "error"
+    } else if [
+        "method not found",
+        "not supported",
+        "unsupported",
+        "is unavailable in this codex version",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        "unsupported"
+    } else {
+        "error"
+    }
+}
+
+/// A thread can be absent, inaccessible, or unsupported while primary account
+/// reads succeeded. These outcomes never change the account's auth status.
+pub fn thread_error_is_unavailable(error: &str) -> bool {
+    ["(RPC code 403)", "(RPC code 404)", "(RPC code -32602)"]
+        .iter()
+        .any(|code| error.contains(code))
+        || error.contains("is unavailable in this Codex version")
+}
+
+/// Thread snapshots are independent evidence of a successful synchronized
+/// source. Their failures are deliberately absent from primary warnings.
+pub fn sync_connection_status(
+    primary_data_available: bool,
+    verified_thread_data_available: bool,
+    primary_warnings: &str,
+) -> Result<&'static str, String> {
+    if !primary_data_available && !verified_thread_data_available {
+        return Err(if primary_warnings.is_empty() {
+            "The installed Codex service did not return supported usage or rate-limit data".into()
+        } else {
+            primary_warnings.into()
+        });
+    }
+    Ok(
+        if error_connection_status(primary_warnings) == "reauth_required" {
+            "reauth_required"
+        } else {
+            "connected"
+        },
+    )
+}
+
+fn definite_transport_error(error: &str) -> bool {
+    [
+        "Codex App Server stopped.",
+        "Codex connection closed",
+        "Cannot read Codex response",
+        "Codex connection is unavailable after a transport failure",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+        || (error.starts_with("Codex ") && error.ends_with(" timed out"))
+}
+
+fn transient_transport_error(error: &str) -> bool {
+    error_connection_status(error) != "reauth_required" && definite_transport_error(error)
+}
+
+fn payload_errors(payload: &Value) -> impl Iterator<Item = &str> {
+    payload
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+async fn sync_with_transport_retry<F, Fut>(mut attempt: F) -> Result<Value, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    let first = attempt().await;
+    let retry = match &first {
+        Err(error) => transient_transport_error(error),
+        Ok(payload) => {
+            !payload_errors(payload)
+                .any(|error| error_connection_status(error) == "reauth_required")
+                && payload_errors(payload).any(transient_transport_error)
+        }
+    };
+    if !retry {
+        return first;
+    }
+    // The attempt owns and stops its RPC before another one starts. A linked
+    // account borrows the same short-lived token, never another refresh owner.
+    let second = attempt().await;
+    match (first, second) {
+        (Ok(mut first), Ok(mut second)) => {
+            // Never combine responses from different authenticated identities.
+            if first.get("account") != second.get("account") {
+                return Ok(second);
+            }
+            for field in ["usage", "rateLimits"] {
+                if second.get(field).is_none_or(Value::is_null) {
+                    if let Some(value) = first.get_mut(field).filter(|value| !value.is_null()) {
+                        second[field] = value.take();
+                    }
+                }
+            }
+            Ok(second)
+        }
+        (Ok(mut first), Err(error)) => {
+            let errors = first["errors"]
+                .as_array_mut()
+                .expect("collector errors array");
+            errors.push(Value::String(format!("Transport retry failed: {error}")));
+            Ok(first)
+        }
+        (Err(_), second) => second,
+    }
+}
 
 struct Rpc {
     child: Option<Box<dyn TokioChildWrapper>>,
@@ -169,16 +353,24 @@ impl Rpc {
             notifications: VecDeque::new(),
             unusable: false,
         };
-        rpc.request(
-            "initialize",
-            Some(json!({
-                "clientInfo": {"name":"cc_switch_usage", "title":"CC Switch Usage Analytics", "version":env!("CARGO_PKG_VERSION")},
-                "capabilities": {"experimentalApi":external}
-            })),
-        )
-        .await?;
-        rpc.send(json!({"method":"initialized", "params":{}}))
+        let initialized = async {
+            rpc.request(
+                "initialize",
+                Some(json!({
+                    "clientInfo": {"name":"cc_switch_usage", "title":"CC Switch Usage Analytics", "version":env!("CARGO_PKG_VERSION")},
+                    "capabilities": {"experimentalApi":external}
+                })),
+            )
             .await?;
+            rpc.send(json!({"method":"initialized", "params":{}})).await
+        }
+        .await;
+        if let Err(error) = initialized {
+            // A fresh transport retry must not race an initializing child that
+            // has only been scheduled for asynchronous Drop cleanup.
+            rpc.stop().await;
+            return Err(error);
+        }
         Ok(rpc)
     }
 
@@ -246,12 +438,7 @@ impl Rpc {
                 };
                 if value.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(error) = value.get("error") {
-                        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                        return Err(if code == -32601 {
-                            format!("{method} is unavailable in this Codex version; upgrade the official CLI")
-                        } else {
-                            format!("Codex {method} failed (code {code}). Reconnect if authentication expired; OS keyring is required")
-                        });
+                        return Err(rpc_error(method, error));
                     }
                     return value.get("result").cloned().ok_or_else(|| "Missing Codex result".to_string());
                 }
@@ -492,21 +679,30 @@ pub async fn cancel_pending(profile_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn sync(profile_id: &str) -> Result<Value, String> {
+pub async fn sync(profile_id: &str, thread_ids: &[String]) -> Result<Value, String> {
+    sync_with_transport_retry(|| sync_once(profile_id, thread_ids)).await
+}
+
+async fn sync_account_rpc(rpc: &mut Rpc, thread_ids: &[String]) -> Result<Value, String> {
+    let account = rpc
+        .request("account/read", Some(json!({"refreshToken":true})))
+        .await?;
+    require_chatgpt(&account)?;
+    collect_usage(rpc, account, thread_ids).await
+}
+
+async fn sync_once(profile_id: &str, thread_ids: &[String]) -> Result<Value, String> {
     let mut rpc = Rpc::start(profile_id).await?;
-    let result = async {
-        let account = rpc
-            .request("account/read", Some(json!({"refreshToken":true})))
-            .await?;
-        require_chatgpt(&account)?;
-        collect_usage(&mut rpc, account).await
-    }
-    .await;
+    let result = sync_account_rpc(&mut rpc, thread_ids).await;
     rpc.stop().await;
     result
 }
 
-async fn collect_usage(rpc: &mut Rpc, account: Value) -> Result<Value, String> {
+async fn collect_usage(
+    rpc: &mut Rpc,
+    account: Value,
+    thread_ids: &[String],
+) -> Result<Value, String> {
     // These are independent; unavailable token activity must not hide valid quota.
     let usage = rpc.request("account/usage/read", None).await;
     let limits = rpc.request("account/rateLimits/read", None).await;
@@ -519,7 +715,52 @@ async fn collect_usage(rpc: &mut Rpc, account: Value) -> Result<Value, String> {
         errors.push(error);
         Value::Null
     });
-    Ok(json!({"account":account["account"], "usage":usage, "rateLimits":limits, "errors":errors}))
+    // Thread summaries are a separate lifetime source. A rejected, missing, or
+    // interrupted thread must never hide primary daily activity or quota, nor
+    // initiate another authentication or whole-account retry.
+    let mut thread_checks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let thread_deadline = tokio::time::Instant::now() + THREAD_COLLECTION_BUDGET;
+    for id in thread_ids {
+        let Ok(id) = uuid::Uuid::parse_str(id) else {
+            continue;
+        };
+        let id = id.to_string();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if thread_checks.len() == 3 {
+            break;
+        }
+        if rpc.unusable || tokio::time::Instant::now() >= thread_deadline {
+            break;
+        }
+        let response = {
+            let deadline =
+                thread_deadline.min(tokio::time::Instant::now() + THREAD_REQUEST_TIMEOUT);
+            match tokio::time::timeout_at(
+                deadline,
+                rpc.request("account/usage/read", Some(json!({"threadId":id}))),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    // A cancelled JSONL read cannot be reused after its frame
+                    // may have been partially consumed. Primary data is safe.
+                    rpc.unusable = true;
+                    Err("Thread usage timed out; account activity remains available".into())
+                }
+            }
+        };
+        thread_checks.push(match response {
+            Ok(response) => json!({"threadId":id,"response":response,"error":null}),
+            Err(error) => json!({"threadId":id,"response":null,"error":error}),
+        });
+    }
+    Ok(
+        json!({"account":account["account"], "usage":usage, "rateLimits":limits, "errors":errors,"threadChecks":thread_checks}),
+    )
 }
 
 /// Borrow a short-lived access token from CC Switch's existing account owner.
@@ -529,6 +770,7 @@ pub async fn sync_external(
     profile_id: &str,
     access_token: String,
     workspace_id: String,
+    thread_ids: &[String],
 ) -> Result<Value, String> {
     if access_token.is_empty()
         || access_token.len() > 65_536
@@ -537,8 +779,26 @@ pub async fn sync_external(
     {
         return Err("Existing CC Switch account credentials are unavailable; the original sign-in is unchanged".into());
     }
+    sync_with_transport_retry(|| {
+        sync_external_once(profile_id, &access_token, &workspace_id, thread_ids)
+    })
+    .await
+}
+
+async fn sync_external_once(
+    profile_id: &str,
+    access_token: &str,
+    workspace_id: &str,
+    thread_ids: &[String],
+) -> Result<Value, String> {
     let mut rpc = Rpc::start_config(profile_id, true).await?;
-    let result = sync_external_rpc(&mut rpc, access_token, workspace_id).await;
+    let result = sync_external_rpc(
+        &mut rpc,
+        access_token.into(),
+        workspace_id.into(),
+        thread_ids,
+    )
+    .await;
     // Termination drops only this ephemeral process; it cannot revoke the owner.
     rpc.stop().await;
     result
@@ -548,6 +808,7 @@ async fn sync_external_rpc(
     rpc: &mut Rpc,
     access_token: String,
     workspace_id: String,
+    thread_ids: &[String],
 ) -> Result<Value, String> {
     rpc.request(
         "account/login/start",
@@ -563,7 +824,7 @@ async fn sync_external_rpc(
         .request("account/read", Some(json!({"refreshToken":false})))
         .await?;
     require_chatgpt(&account)?;
-    collect_usage(rpc, account).await
+    collect_usage(rpc, account, thread_ids).await
 }
 
 pub async fn disconnect(profile_id: &str) -> Result<(), String> {
@@ -594,6 +855,495 @@ mod tests {
             },
             server,
         )
+    }
+
+    fn serve_replay(
+        server: tokio::io::DuplexStream,
+        steps: Vec<(&'static str, Option<Value>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for (method, response) in steps {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                let Some(mut response) = response else {
+                    return; // A real EOF on this attempt's independent pipe.
+                };
+                response["id"] = request["id"].clone();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        })
+    }
+
+    fn replay_account() -> Value {
+        json!({"result":{"account":{"type":"chatgpt","email":"replay@example.test","planType":"pro"}}})
+    }
+
+    async fn retry_replay(rpcs: Vec<Rpc>) -> (Result<Value, String>, usize) {
+        let mut rpcs = VecDeque::from(rpcs);
+        let mut attempts = 0;
+        let result = sync_with_transport_retry(|| {
+            attempts += 1;
+            let mut rpc = rpcs
+                .pop_front()
+                .expect("retry exceeded its fresh RPC budget");
+            async move {
+                let result = sync_account_rpc(&mut rpc, &[]).await;
+                rpc.stop().await;
+                result
+            }
+        })
+        .await;
+        (result, attempts)
+    }
+
+    #[tokio::test]
+    async fn transport_eof_retries_one_fresh_rpc_and_recovers() {
+        let (first, first_server) = replay_rpc();
+        let (second, second_server) = replay_rpc();
+        let first_task = serve_replay(first_server, vec![("account/read", None)]);
+        let second_task = serve_replay(
+            second_server,
+            vec![
+                ("account/read", Some(replay_account())),
+                (
+                    "account/usage/read",
+                    Some(
+                        json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":7}]}}),
+                    ),
+                ),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"result":{"rateLimits":null}})),
+                ),
+            ],
+        );
+        let (result, attempts) = retry_replay(vec![first, second]).await;
+        let result = result.unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 7);
+        assert_eq!(result["errors"], json!([]));
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_transport_eofs_stop_after_exactly_one_retry() {
+        let (first, first_server) = replay_rpc();
+        let (second, second_server) = replay_rpc();
+        let first_task = serve_replay(first_server, vec![("account/read", None)]);
+        let second_task = serve_replay(second_server, vec![("account/read", None)]);
+        let (result, attempts) = retry_replay(vec![first, second]).await;
+        assert_eq!(attempts, 2);
+        assert!(result.unwrap_err().contains("App Server stopped"));
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_retries_using_a_fresh_rpc() {
+        let (first, _silent_server) = replay_rpc();
+        let (second, second_server) = replay_rpc();
+        let task = serve_replay(
+            second_server,
+            vec![
+                ("account/read", Some(replay_account())),
+                (
+                    "account/usage/read",
+                    Some(json!({"result":{"dailyUsageBuckets":null}})),
+                ),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"result":{"rateLimits":null}})),
+                ),
+            ],
+        );
+        let (result, attempts) = retry_replay(vec![first, second]).await;
+        assert_eq!(attempts, 2);
+        assert!(result.unwrap()["errors"].as_array().unwrap().is_empty());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_rpc_rejections_never_retry() {
+        for error in [
+            json!({"code":401}),
+            json!({"code":403}),
+            json!({"code":-32000,"data":{"type":"authentication_error"}}),
+            json!({"code":-32000,"message":"unauthorized"}),
+        ] {
+            let (rpc, server) = replay_rpc();
+            let task = serve_replay(server, vec![("account/read", Some(json!({"error":error})))]);
+            let (result, attempts) = retry_replay(vec![rpc]).await;
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                error_connection_status(&result.unwrap_err()),
+                "reauth_required"
+            );
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_rpc_rejections_remain_error_without_an_immediate_retry() {
+        for code in [429, 500, -32602, -32603] {
+            let (rpc, server) = replay_rpc();
+            let task = serve_replay(
+                server,
+                vec![(
+                    "account/read",
+                    Some(
+                        json!({"error":{"code":code,"message":"Internal failure; reconnect only if authentication expired"}}),
+                    ),
+                )],
+            );
+            let (result, attempts) = retry_replay(vec![rpc]).await;
+            let error = result.unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error_connection_status(&error), "error");
+            assert!(!error.contains("expired"));
+            assert!(!error.contains("keyring"));
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_usage_does_not_stop_retrying_a_temporary_quota_failure() {
+        let (rpc, server) = replay_rpc();
+        let task = serve_replay(
+            server,
+            vec![
+                ("account/read", Some(replay_account())),
+                ("account/usage/read", Some(json!({"error":{"code":-32601}}))),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"error":{"code":429}})),
+                ),
+            ],
+        );
+        let (result, attempts) = retry_replay(vec![rpc]).await;
+        let result = result.unwrap();
+        assert_eq!(attempts, 1);
+        assert!(result["usage"].is_null() && result["rateLimits"].is_null());
+        let errors = payload_errors(&result).collect::<Vec<_>>().join("; ");
+        assert_eq!(error_connection_status(&errors), "error");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_first_usage_when_only_quota_recovers() {
+        let (first, first_server) = replay_rpc();
+        let (second, second_server) = replay_rpc();
+        let first_task = serve_replay(
+            first_server,
+            vec![
+                ("account/read", Some(replay_account())),
+                (
+                    "account/usage/read",
+                    Some(
+                        json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":12}]}}),
+                    ),
+                ),
+                ("account/rateLimits/read", None),
+            ],
+        );
+        let second_task = serve_replay(
+            second_server,
+            vec![
+                ("account/read", Some(replay_account())),
+                ("account/usage/read", Some(json!({"error":{"code":500}}))),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"result":{"rateLimits":{"primary":{"usedPercent":3}}}})),
+                ),
+            ],
+        );
+        let (result, attempts) = retry_replay(vec![first, second]).await;
+        let result = result.unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 12);
+        assert_eq!(
+            result["rateLimits"]["rateLimits"]["primary"]["usedPercent"],
+            3
+        );
+        assert_eq!(
+            error_connection_status(result["errors"][0].as_str().unwrap()),
+            "error"
+        );
+        assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_retry_retains_valid_partial_data_and_reports_the_failure() {
+        let (first, first_server) = replay_rpc();
+        let (second, second_server) = replay_rpc();
+        let first_task = serve_replay(
+            first_server,
+            vec![
+                ("account/read", Some(replay_account())),
+                (
+                    "account/usage/read",
+                    Some(
+                        json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":19}]}}),
+                    ),
+                ),
+                ("account/rateLimits/read", None),
+            ],
+        );
+        let second_task = serve_replay(second_server, vec![("account/read", None)]);
+        let (result, attempts) = retry_replay(vec![first, second]).await;
+        let result = result.unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 19);
+        assert!(result["rateLimits"].is_null());
+        assert!(payload_errors(&result).any(|error| error.contains("Transport retry failed")));
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_auth_failure_keeps_quota_without_retry_or_false_connected_status() {
+        let (rpc, server) = replay_rpc();
+        let task = serve_replay(
+            server,
+            vec![
+                ("account/read", Some(replay_account())),
+                ("account/usage/read", Some(json!({"error":{"code":401}}))),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"result":{"rateLimits":{"primary":{"usedPercent":4}}}})),
+                ),
+            ],
+        );
+        let (result, attempts) = retry_replay(vec![rpc]).await;
+        let result = result.unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            result["rateLimits"]["rateLimits"]["primary"]["usedPercent"],
+            4
+        );
+        assert_eq!(
+            error_connection_status(result["errors"][0].as_str().unwrap()),
+            "reauth_required"
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_queries_are_bounded_and_rejections_do_not_change_primary_auth_status() {
+        let ids: Vec<String> = (1..=4)
+            .map(|id| format!("00000000-0000-0000-0000-{id:012}"))
+            .collect();
+        let (mut rpc, server) = replay_rpc();
+        let expected_ids = ids[..3].to_vec();
+        let task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for index in 0..6 {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut response = match index {
+                    0 => {
+                        assert_eq!(request["method"], "account/read");
+                        replay_account()
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "account/usage/read");
+                        assert!(request.get("params").is_none());
+                        json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":23}]}})
+                    }
+                    2 => {
+                        assert_eq!(request["method"], "account/rateLimits/read");
+                        json!({"result":{"rateLimits":null}})
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "account/usage/read");
+                        assert_eq!(request["params"]["threadId"], expected_ids[index - 3]);
+                        json!({"error":{"code":([403,404,-32602][index - 3])}})
+                    }
+                };
+                response["id"] = request["id"].clone();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let mut extra = String::new();
+            assert_eq!(server.read_line(&mut extra).await.unwrap(), 0);
+        });
+        let candidates = vec![
+            "invalid".into(),
+            ids[0].clone(),
+            ids[0].clone(),
+            ids[1].clone(),
+            ids[2].clone(),
+            ids[3].clone(),
+        ];
+        let result = sync_account_rpc(&mut rpc, &candidates).await.unwrap();
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 23);
+        assert_eq!(result["errors"], json!([]));
+        assert_eq!(result["threadChecks"].as_array().unwrap().len(), 3);
+        assert!(result["threadChecks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["error"].is_string()));
+        assert!(result["threadChecks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| thread_error_is_unavailable(check["error"].as_str().unwrap())));
+        rpc.stop().await;
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verified_thread_usage_keeps_sync_connected_when_primary_methods_are_unsupported() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let (mut rpc, server) = replay_rpc();
+        let task = serve_replay(
+            server,
+            vec![
+                ("account/read", Some(replay_account())),
+                ("account/usage/read", Some(json!({"error":{"code":-32601}}))),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"error":{"code":-32601}})),
+                ),
+                (
+                    "account/usage/read",
+                    Some(
+                        json!({"result":{"threadUsage":{"threadId":id,"estimatedUsageCreditsMicros":0,"estimatedUsageUsdMicros":100,"nativeUsageUsdMicros":null,"groups":[]}}}),
+                    ),
+                ),
+            ],
+        );
+        let payload = sync_account_rpc(&mut rpc, &[id.to_owned()]).await.unwrap();
+        assert!(payload["usage"].is_null() && payload["rateLimits"].is_null());
+        let snapshot = super::super::unified_usage_threads::parse_thread_usage(
+            id,
+            &payload["threadChecks"][0]["response"],
+        )
+        .unwrap();
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().day, None);
+        let warnings = payload_errors(&payload).collect::<Vec<_>>().join("; ");
+        assert_eq!(
+            sync_connection_status(false, true, &warnings).unwrap(),
+            "connected"
+        );
+        assert!(sync_connection_status(false, false, &warnings).is_err());
+        rpc.stop().await;
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_transport_failure_never_retries_or_hides_primary_data() {
+        let ids: Vec<String> = (1..=3)
+            .map(|id| format!("00000000-0000-0000-0000-{id:012}"))
+            .collect();
+        let (rpc, server) = replay_rpc();
+        let task = serve_replay(
+            server,
+            vec![
+                ("account/read", Some(replay_account())),
+                (
+                    "account/usage/read",
+                    Some(
+                        json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":29}]}}),
+                    ),
+                ),
+                (
+                    "account/rateLimits/read",
+                    Some(json!({"result":{"rateLimits":{"primary":{"usedPercent":5}}}})),
+                ),
+                ("account/usage/read", None),
+            ],
+        );
+        let mut rpcs = VecDeque::from(vec![rpc]);
+        let mut attempts = 0;
+        let result = sync_with_transport_retry(|| {
+            attempts += 1;
+            let mut rpc = rpcs
+                .pop_front()
+                .expect("thread-only failure retried primary RPC");
+            let ids = ids.clone();
+            async move {
+                let result = sync_account_rpc(&mut rpc, &ids).await;
+                rpc.stop().await;
+                result
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 29);
+        assert_eq!(
+            result["rateLimits"]["rateLimits"]["primary"]["usedPercent"],
+            5
+        );
+        assert_eq!(result["errors"], json!([]));
+        assert_eq!(result["threadChecks"].as_array().unwrap().len(), 1);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thread_timeout_keeps_primary_data_and_leaves_other_candidates_unchecked() {
+        let ids: Vec<String> = (1..=3)
+            .map(|id| format!("00000000-0000-0000-0000-{id:012}"))
+            .collect();
+        let (mut rpc, server) = replay_rpc();
+        let task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for response in [
+                replay_account(),
+                json!({"result":{"dailyUsageBuckets":[{"startDate":"2026-11-04","tokens":31}]}}),
+                json!({"result":{"rateLimits":null}}),
+            ] {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut response = response;
+                response["id"] = request["id"].clone();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["params"]["threadId"],
+                "00000000-0000-0000-0000-000000000001"
+            );
+            // Deliberately leave this request unanswered until the client kills
+            // this transport. Another thread request must never reuse it.
+            line.clear();
+            assert_eq!(server.read_line(&mut line).await.unwrap(), 0);
+        });
+        let start = tokio::time::Instant::now();
+        let result = sync_account_rpc(&mut rpc, &ids).await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - start, THREAD_REQUEST_TIMEOUT);
+        assert_eq!(result["usage"]["dailyUsageBuckets"][0]["tokens"], 31);
+        assert_eq!(result["errors"], json!([]));
+        assert_eq!(result["threadChecks"].as_array().unwrap().len(), 1);
+        assert!(result["threadChecks"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"));
+        assert!(rpc.unusable);
+        rpc.stop().await;
+        task.await.unwrap();
     }
 
     fn replay_login(rpc: Rpc) -> Arc<Login> {
@@ -656,6 +1406,7 @@ mod tests {
             &mut rpc,
             "test-ephemeral-access".into(),
             "test-workspace".into(),
+            &[],
         )
         .await
         .unwrap();
@@ -700,7 +1451,8 @@ mod tests {
         assert!(sync_external_rpc(
             &mut rpc,
             "expired-test-access".into(),
-            "test-workspace".into()
+            "test-workspace".into(),
+            &[]
         )
         .await
         .is_err());

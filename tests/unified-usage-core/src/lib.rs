@@ -47,6 +47,7 @@ pub mod database {
                 "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);",
             )?;
             crate::unified_usage::create_schema(&conn)?;
+            crate::unified_usage_thread_store::create_thread_schema(&conn)?;
             let db = Self {
                 conn: Mutex::new(conn),
             };
@@ -83,6 +84,17 @@ pub mod custom_release;
 
 #[path = "../../../src-tauri/src/services/unified_usage.rs"]
 pub mod unified_usage;
+
+#[path = "../../../src-tauri/src/services/unified_usage_threads.rs"]
+pub mod unified_usage_threads;
+
+#[path = "../../../src-tauri/src/services/unified_usage_thread_store.rs"]
+pub mod unified_usage_thread_store;
+
+pub mod services {
+    pub use crate::unified_usage_thread_store;
+    pub use crate::unified_usage_threads;
+}
 
 #[cfg(test)]
 mod persistence_tests {
