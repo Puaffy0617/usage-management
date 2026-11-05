@@ -311,8 +311,12 @@ impl Rpc {
         })
         .await
         .map_err(|_| "Cannot locate Codex CLI".to_string())?
-        .map_err(|_| {
-            "Install a current official Codex CLI and make it available on PATH".to_string()
+        .map_err(|error| {
+            if error.starts_with("Quiet Codex commands require ") {
+                error
+            } else {
+                "Install a current official Codex CLI and make it available on PATH".to_string()
+            }
         })?;
         let mut command = Command::from(std_command);
         command

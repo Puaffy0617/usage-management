@@ -24,9 +24,6 @@ pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
 /// Value that disables the web-search tool. Some native `/responses` gateways
@@ -1793,22 +1790,27 @@ fn push_codex_cli_candidates_newest_first(
     }
 }
 
-fn codex_bundled_models_command(candidate: &Path) -> Command {
-    let mut command = Command::new(candidate);
-    command
-        .args(["debug", "models", "--bundled"])
-        .stdin(Stdio::null());
-
-    // A release build uses the Windows GUI subsystem, so a console child that
-    // is created without this flag gets its own transient console window. npm
-    // installs Codex as `codex.cmd`, which Windows launches through cmd.exe.
+fn codex_bundled_models_command(candidate: &Path) -> std::io::Result<Command> {
+    let args = ["debug", "models", "--bundled"];
     #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    command
+    let mut command = if candidate == Path::new("codex") {
+        crate::commands::detected_tool_command("codex", &args, std::time::Duration::from_secs(15))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))?
+    } else {
+        crate::services::quiet_codex::native_command(
+            candidate,
+            &args,
+            &std::env::var("PATH").unwrap_or_default(),
+        )?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new(candidate);
+        command.args(args);
+        command
+    };
+    command.stdin(Stdio::null());
+    Ok(command)
 }
 
 /// 没跑出 Codex 自带的模型列表。
@@ -1852,7 +1854,9 @@ fn first_bundled_catalog<T>(
     let mut failure = None;
     for candidate in candidates {
         let candidate_label = candidate.to_string_lossy();
-        let output = match codex_bundled_models_command(&candidate).output() {
+        let output = match codex_bundled_models_command(&candidate)
+            .and_then(|mut command| command.output())
+        {
             Ok(output) => output,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -6121,9 +6125,10 @@ wire_api = "responses"
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn codex_bundled_models_command_uses_expected_program_and_args() {
-        let command = codex_bundled_models_command(Path::new("codex"));
+        let command = codex_bundled_models_command(Path::new("codex")).unwrap();
         assert_eq!(command.get_program(), "codex");
         assert_eq!(
             command
@@ -6132,6 +6137,21 @@ wire_api = "responses"
                 .collect::<Vec<_>>(),
             ["debug", "models", "--bundled"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bundled_model_probe_never_runs_an_unverified_script_launcher() {
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("codex.cmd");
+        let marker = temporary.path().join("unwanted-launch.txt");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho launched>\"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        assert!(codex_bundled_models_command(&script).is_err());
+        assert!(!marker.exists());
     }
 
     #[test]

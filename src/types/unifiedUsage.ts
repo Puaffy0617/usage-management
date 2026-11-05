@@ -134,3 +134,24 @@ export interface ThreadUsageDashboard {
   records: ThreadUsageRecord[];
   candidateCount: number;
 }
+
+export interface AnalyticsSyncSettings {
+  enabled: boolean;
+  intervalMinutes: 1 | 2 | 5;
+}
+
+export interface AnalyticsAccountSyncStatus {
+  accountId: string;
+  running: boolean;
+  lastAttemptAt: number | null;
+  lastFinishedAt: number | null;
+  nextDueAt: number | null;
+}
+
+export interface AnalyticsBackgroundSyncStatus {
+  running: boolean;
+  lastAttemptAt: number | null;
+  lastFinishedAt: number | null;
+  nextDueAt: number | null;
+  accounts: AnalyticsAccountSyncStatus[];
+}

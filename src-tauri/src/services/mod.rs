@@ -23,6 +23,8 @@ pub mod profile;
 pub mod prompt;
 pub mod provider;
 pub mod proxy;
+#[cfg(any(windows, test))]
+pub mod quiet_codex;
 pub mod s3;
 pub mod s3_auto_sync;
 pub mod s3_sync;
@@ -44,6 +46,7 @@ pub mod sync_protocol;
 pub mod unified_updates;
 pub mod unified_usage;
 pub mod unified_usage_codex;
+pub mod unified_usage_sync;
 pub mod unified_usage_thread_store;
 pub mod unified_usage_threads;
 pub mod usage_cache;

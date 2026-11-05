@@ -2,6 +2,9 @@
 use crate::database::Database;
 use crate::error::AppError;
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthError;
+use crate::services::unified_usage_sync::{
+    sync_coordinator, BackgroundSyncSettings, BackgroundSyncStatus,
+};
 use crate::services::unified_usage_thread_store::{ThreadCheckResult, ThreadUsageDashboard};
 use crate::services::unified_usage_threads::{
     discover_thread_candidates, parse_thread_usage, DiscoveryLimits, ThreadCandidate,
@@ -13,10 +16,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::sync::Mutex;
 
-async fn db_task<T, F>(state: &State<'_, AppState>, task: F) -> Result<T, String>
+async fn db_task<T, F>(state: &AppState, task: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> Result<T, AppError> + Send + 'static,
@@ -251,9 +254,11 @@ pub async fn unified_usage_cancel_login(
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncResult {
     pub accounts: Vec<AnalyticsAccount>,
     pub errors: Vec<String>,
+    pub already_running: bool,
 }
 
 fn error_status(error: &str) -> &'static str {
@@ -301,15 +306,37 @@ async fn thread_candidates() -> Vec<ThreadCandidate> {
 pub async fn unified_usage_sync(
     state: State<'_, AppState>,
     account_id: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
-    let accounts = db_task(&state, Database::unified_usage_accounts).await?;
+    synchronize_accounts(state.inner(), account_id, false, Some(&app)).await
+}
+
+async fn synchronize_accounts(
+    state: &AppState,
+    account_id: Option<String>,
+    automatic: bool,
+    app: Option<&tauri::AppHandle>,
+) -> Result<SyncResult, String> {
+    let Some(_batch) = sync_coordinator().try_begin() else {
+        return Ok(SyncResult {
+            accounts: db_task(state, Database::unified_usage_accounts).await?,
+            errors: Vec::new(),
+            already_running: true,
+        });
+    };
+    let accounts = db_task(state, Database::unified_usage_accounts).await?;
     let targets: Vec<_> = accounts
         .into_iter()
         .filter(|a| {
-            account_id.as_ref().map_or(
-                a.connection_status != "disconnected" && a.identity.is_some(),
-                |id| id == &a.id,
-            )
+            if automatic {
+                ["connected", "error"].contains(&a.connection_status.as_str())
+                    && a.identity.is_some()
+            } else {
+                account_id.as_ref().map_or(
+                    a.connection_status != "disconnected" && a.identity.is_some(),
+                    |id| id == &a.id,
+                )
+            }
         })
         .collect();
     if account_id.is_some() && targets.is_empty() {
@@ -329,7 +356,7 @@ pub async fn unified_usage_sync(
         // The list may be stale after waiting for another account/network read.
         // Respect a disconnect/delete or browser sign-in that happened meanwhile.
         let id = target.id.clone();
-        let current = match db_task(&state, move |db| db.unified_usage_account(&id)).await {
+        let current = match db_task(state, move |db| db.unified_usage_account(&id)).await {
             Ok(account) => account,
             Err(error) => {
                 errors.push(format!("{}: {error}", target.name));
@@ -348,9 +375,24 @@ pub async fn unified_usage_sync(
             }
             continue;
         }
+        if automatic {
+            let account = current.clone();
+            match db_task(state, move |db| {
+                db.unified_usage_sync_account_due(&account, chrono::Utc::now().timestamp_millis())
+            })
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    log::warn!("Background account refresh policy could not be read; this account was skipped");
+                    continue;
+                }
+            }
+        }
         let id = target.id.clone();
         let candidates = discovered_threads.clone();
-        let thread_ids = match db_task(&state, move |db| {
+        let thread_ids = match db_task(state, move |db| {
             db.unified_usage_thread_select_targets(
                 &id,
                 &candidates,
@@ -370,10 +412,20 @@ pub async fn unified_usage_sync(
             }
         };
         let id = target.id.clone();
-        let run = db_task(&state, move |db| {
+        let run = match db_task(state, move |db| {
             db.unified_usage_begin_sync(&id, "codex_app_server")
         })
-        .await?;
+        .await
+        {
+            Ok(run) => run,
+            Err(error) => {
+                errors.push(format!("{}: {error}", target.name));
+                continue;
+            }
+        };
+        if let Some(app) = app {
+            let _ = app.emit("unified-usage-sync-updated", ());
+        }
         let outcome = if let Some(source_id) = current.linked_account_id.as_deref() {
             // The original account manager remains the only refresh-token owner.
             // Only a short-lived access token crosses the in-memory RPC bridge.
@@ -392,7 +444,7 @@ pub async fn unified_usage_sync(
         let processed = match outcome {
             Ok(payload) => {
                 let id = target.id.clone();
-                db_task(&state,move|db|{
+                db_task(state,move|db|{
                     let account=payload.get("account").filter(|v|!v.is_null()).ok_or_else(||AppError::InvalidInput("Codex did not report the authenticated account".into()))?;
                     db.unified_usage_bind_identity(&id,account)?;
                     let checks=payload.get("threadChecks").and_then(Value::as_array).into_iter().flatten().filter_map(|check| {
@@ -431,10 +483,14 @@ pub async fn unified_usage_sync(
                     "partial"
                 };
                 let note = (!warnings.is_empty()).then_some(warnings.clone());
-                db_task(&state, move |db| {
+                if db_task(state, move |db| {
                     db.unified_usage_finish_sync(&run, status, count, note.as_deref())
                 })
-                .await?;
+                .await
+                .is_err()
+                {
+                    errors.push("Account synchronization history could not be saved".into());
+                }
                 if !warnings.is_empty() {
                     errors.push(format!("{}: {warnings}", target.name));
                 }
@@ -442,19 +498,99 @@ pub async fn unified_usage_sync(
             Err(error) => {
                 let id = target.id.clone();
                 let message = error.clone();
-                db_task(&state, move |db| {
+                if db_task(state, move |db| {
                     db.unified_usage_set_status(&id, error_status(&message), Some(&message))?;
                     db.unified_usage_finish_sync(&run, "error", 0, Some(&message))
                 })
-                .await?;
+                .await
+                .is_err()
+                {
+                    errors.push("Account synchronization failure could not be saved".into());
+                }
                 errors.push(format!("{}: {error}", target.name));
             }
         }
+        if let Some(app) = app {
+            let _ = app.emit("unified-usage-sync-updated", ());
+        }
     }
     Ok(SyncResult {
-        accounts: db_task(&state, Database::unified_usage_accounts).await?,
+        accounts: db_task(state, Database::unified_usage_accounts).await?,
         errors,
+        already_running: false,
     })
+}
+
+#[tauri::command]
+pub async fn unified_usage_get_sync_settings(
+    state: State<'_, AppState>,
+) -> Result<BackgroundSyncSettings, String> {
+    db_task(&state, Database::unified_usage_get_sync_settings).await
+}
+
+#[tauri::command]
+pub async fn unified_usage_set_sync_settings(
+    state: State<'_, AppState>,
+    settings: BackgroundSyncSettings,
+    app: tauri::AppHandle,
+) -> Result<BackgroundSyncSettings, String> {
+    let result = db_task(&state, move |db| {
+        db.unified_usage_set_sync_settings(settings)
+    })
+    .await?;
+    sync_coordinator().wake();
+    let _ = app.emit("unified-usage-sync-updated", ());
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn unified_usage_sync_status(
+    state: State<'_, AppState>,
+) -> Result<BackgroundSyncStatus, String> {
+    let mut status = db_task(&state, |db| {
+        db.unified_usage_sync_status(chrono::Utc::now().timestamp_millis())
+    })
+    .await?;
+    // Candidate discovery also owns the batch before its first account run is
+    // written. Report that work immediately instead of flashing an idle state.
+    status.running |= sync_coordinator().is_running();
+    Ok(status)
+}
+
+/// Starts exactly once after metadata reconciliation. Runs for the application's
+/// lifetime, including tray/minimized operation; no OS service or renderer timer.
+pub fn unified_usage_start_background_sync(state: AppState, app: tauri::AppHandle) {
+    if !sync_coordinator().start_once() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let status = db_task(&state, |db| {
+                db.unified_usage_sync_status(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            let due = match status {
+                Ok(status) => status
+                    .next_due_at
+                    .is_some_and(|due| due <= chrono::Utc::now().timestamp_millis()),
+                Err(_) => {
+                    log::warn!("Background account refresh policy is unavailable; no authentication was attempted");
+                    false
+                }
+            };
+            if due
+                && synchronize_accounts(&state, None, true, Some(&app))
+                    .await
+                    .is_err()
+            {
+                log::warn!("Background account refresh did not finish; existing data was retained");
+            }
+            tokio::select! {
+                _=sync_coordinator().notified()=>{},
+                _=tokio::time::sleep(Duration::from_secs(15))=>{},
+            }
+        }
+    });
 }
 
 #[tauri::command]

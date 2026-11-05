@@ -16,6 +16,8 @@
 
 `4.0.25-usage.3` 修复原生焦点恢复与临时连接重试，增加持续同步状态、精确总数和单独的官方线程累计快照。数据库仅增加 schema 27 快照表，并将该迁移加入发布前的必需原生检查。覆盖范围与字段限制见 [同步与线程明细](unified-usage-refresh.md)。
 
+`4.0.25-usage.4` 增加原生后台采集、首屏金额/Token 摘要、运行期间价格维护和直接启动原生 Codex 的无控制台路径，详见[后台同步与验证](unified-usage-background.md)。
+
 ## 发布流程
 
 源码中的 `customization/release-channel.json` 固定公开仓库、公钥、`stable` 渠道和定制版本。首次版本格式为 `4.0.25-usage.1`；同一上游版本可增加 `usage.2`、`usage.3`。上游版本另存于 `customization/upstream.json`，不能仅凭应用版本判断原版是否更新。

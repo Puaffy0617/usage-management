@@ -772,7 +772,7 @@ impl Database {
     ) -> Result<AnalyticsAccount, AppError> {
         if minutes != 0 && !(5..=1440).contains(&minutes) {
             return Err(AppError::InvalidInput(
-                "Sync interval must be 0 (manual) or 5–1440 minutes".into(),
+                "Sync interval must be 0 (follow global) or 5–1440 minutes".into(),
             ));
         }
         {

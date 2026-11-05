@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   getModelsDevSyncConfig,
+  getModelPricing,
   updateModelPricingBatch,
   recordModelsDevSyncResult,
 } = vi.hoisted(() => ({
   getModelsDevSyncConfig: vi.fn(),
+  getModelPricing: vi.fn(),
   updateModelPricingBatch: vi.fn(),
   recordModelsDevSyncResult: vi.fn(),
 }));
@@ -13,6 +15,7 @@ const {
 vi.mock("@/lib/api/usage", () => ({
   usageApi: {
     getModelsDevSyncConfig,
+    getModelPricing,
     updateModelPricingBatch,
     recordModelsDevSyncResult,
   },
@@ -26,6 +29,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   MODELS_DEV_STARTUP_SYNC_INTERVAL_MS,
+  MODELS_DEV_BACKGROUND_CHECK_MS,
+  startModelsDevPricingBackground,
   syncModelsDevPricing,
 } from "@/lib/modelsDevAutoSync";
 
@@ -46,6 +51,16 @@ describe("syncModelsDevPricing", () => {
     vi.clearAllMocks();
     updateModelPricingBatch.mockResolvedValue(2);
     recordModelsDevSyncResult.mockResolvedValue(undefined);
+    getModelPricing.mockResolvedValue(
+      ["gpt-5", "custom-model"].map((modelId) => ({
+        modelId,
+        displayName: modelId,
+        inputCostPerMillion: "9",
+        outputCostPerMillion: "9",
+        cacheReadCostPerMillion: "0.1",
+        cacheCreationCostPerMillion: "2.5",
+      })),
+    );
     invokeMock.mockImplementation(async (command: string) => {
       if (command !== "fetch_models_dev") {
         throw new Error(`Unexpected command: ${command}`);
@@ -115,13 +130,15 @@ describe("syncModelsDevPricing", () => {
     const result = await syncModelsDevPricing();
 
     expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
-    expect(updateModelPricingBatch).toHaveBeenCalledWith([
-      expect.objectContaining({ modelId: "gpt-5", inputCostPerMillion: "1" }),
-      expect.objectContaining({
-        modelId: "custom-model",
-        inputCostPerMillion: "0.5",
-      }),
-    ]);
+    expect(updateModelPricingBatch).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ modelId: "gpt-5", inputCostPerMillion: "1" }),
+        expect.objectContaining({
+          modelId: "custom-model",
+          inputCostPerMillion: "0.5",
+        }),
+      ]),
+    );
     expect(result).toMatchObject({
       skipped: false,
       selected: 2,
@@ -198,5 +215,82 @@ describe("syncModelsDevPricing", () => {
 
     await expect(syncModelsDevPricing()).rejects.toThrow("offline");
     expect(recordModelsDevSyncResult).toHaveBeenCalledWith(null, "offline");
+  });
+
+  it("retains known cache prices when the catalog omits them", async () => {
+    getModelsDevSyncConfig.mockResolvedValue(state);
+    await syncModelsDevPricing();
+    expect(updateModelPricingBatch).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          modelId: "gpt-5",
+          inputCostPerMillion: "1",
+          cacheReadCostPerMillion: "0.1",
+          cacheCreationCostPerMillion: "2.5",
+        }),
+      ]),
+    );
+  });
+
+  it("does not add a new model with unknown cache rates as a free cache", async () => {
+    getModelsDevSyncConfig.mockResolvedValue(state);
+    getModelPricing.mockResolvedValue([]);
+    const result = await syncModelsDevPricing();
+    expect(result.imported).toBe(0);
+    expect(updateModelPricingBatch).not.toHaveBeenCalled();
+  });
+
+  it("keeps checking prices in the background without a visible usage page", async () => {
+    vi.useFakeTimers();
+    const hidden = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("hidden");
+    let lastSyncAt: number | null = null;
+    getModelsDevSyncConfig.mockImplementation(async () => ({
+      ...state,
+      config: { ...state.config, lastSyncAt },
+    }));
+    recordModelsDevSyncResult.mockImplementation(
+      async (time: number | null) => {
+        if (time !== null) lastSyncAt = time;
+      },
+    );
+    const onResult = vi.fn();
+    const onError = vi.fn();
+    const stop = startModelsDevPricingBackground(onResult, onError);
+    try {
+      await vi.advanceTimersByTimeAsync(MODELS_DEV_BACKGROUND_CHECK_MS);
+      expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(MODELS_DEV_BACKGROUND_CHECK_MS);
+      expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
+      expect(onResult).toHaveBeenCalledTimes(2);
+      expect(onError).not.toHaveBeenCalled();
+      stop();
+      await vi.advanceTimersByTimeAsync(MODELS_DEV_STARTUP_SYNC_INTERVAL_MS);
+      expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
+    } finally {
+      stop();
+      hidden.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces overlapping manual and background requests", async () => {
+    getModelsDevSyncConfig.mockResolvedValue(state);
+    const first = syncModelsDevPricing();
+    const second = syncModelsDevPricing(undefined, true);
+    expect(second).toBe(first);
+    await Promise.all([first, second]);
+    expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes instead of stalling behind a future success timestamp", async () => {
+    getModelsDevSyncConfig.mockResolvedValue({
+      ...state,
+      config: { ...state.config, lastSyncAt: Date.now() + 86_400_000 },
+    });
+    const result = await syncModelsDevPricing();
+    expect(result.skipped).toBe(false);
+    expect(updateModelPricingBatch).toHaveBeenCalledTimes(1);
   });
 });

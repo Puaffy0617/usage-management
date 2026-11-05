@@ -12,11 +12,14 @@ import { UnifiedUsageDashboard } from "@/components/usage/UnifiedUsageDashboard"
 import { unifiedUsageApi } from "@/lib/api/unifiedUsage";
 import { settingsApi } from "@/lib/api/settings";
 import { WINDOW_ACTIVITY_EVENT } from "@/lib/windowActivity";
+import { emitTauriEvent } from "../msw/tauriMocks";
 import type { ModelPricing } from "@/types/usage";
 import type {
   AnalyticsAccount,
   AnalyticsDashboard,
   MetricAggregate,
+  AnalyticsSyncSettings,
+  AnalyticsBackgroundSyncStatus,
 } from "@/types/unifiedUsage";
 
 vi.mock("@/lib/api/unifiedUsage", () => ({
@@ -25,6 +28,9 @@ vi.mock("@/lib/api/unifiedUsage", () => ({
     importExistingAccounts: vi.fn(),
     dashboard: vi.fn(),
     threadDashboard: vi.fn(),
+    getSyncSettings: vi.fn(),
+    setSyncSettings: vi.fn(),
+    syncStatus: vi.fn(),
     sync: vi.fn(),
     addAccount: vi.fn(),
     updateAccount: vi.fn(),
@@ -81,6 +87,8 @@ const metric = (accountId: string, value: number): MetricAggregate => ({
 });
 let accounts: AnalyticsAccount[];
 let dashboard: AnalyticsDashboard;
+let syncSettings: AnalyticsSyncSettings;
+let backgroundSync: AnalyticsBackgroundSyncStatus;
 
 function show() {
   return render(
@@ -111,6 +119,26 @@ beforeEach(() => {
     providerUrl: null,
   });
   accounts = [];
+  syncSettings = { enabled: true, intervalMinutes: 2 };
+  backgroundSync = {
+    running: false,
+    lastAttemptAt: null,
+    lastFinishedAt: null,
+    nextDueAt: null,
+    accounts: [],
+  };
+  vi.mocked(unifiedUsageApi.getSyncSettings).mockImplementation(
+    async () => syncSettings,
+  );
+  vi.mocked(unifiedUsageApi.setSyncSettings).mockImplementation(
+    async (settings) => {
+      syncSettings = { ...settings };
+      return syncSettings;
+    },
+  );
+  vi.mocked(unifiedUsageApi.syncStatus).mockImplementation(
+    async () => backgroundSync,
+  );
   dashboard = {
     accounts: [],
     totals: [],
@@ -380,11 +408,12 @@ describe("Unified account analytics", () => {
     expect(unifiedUsageApi.disconnectAccount).not.toHaveBeenCalled();
   });
 
-  it("resumes both due accounts on native-only activity changes, independently of account filters, only while visible and focused", async () => {
+  it("only reads native worker results while mounted and never starts a renderer collector, even for overdue accounts or focus changes", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     const now = Date.parse("2026-11-05T12:00:00Z");
     vi.setSystemTime(now);
     document.documentElement.dataset.windowActive = "false";
+    localStorage.setItem("cc-switch.unified-usage.autoRefresh", "0");
     accounts = [
       { ...makeAccount("A"), lastSyncAt: now - 600000 },
       { ...makeAccount("B"), lastSyncAt: now - 600000 },
@@ -394,7 +423,7 @@ describe("Unified account analytics", () => {
     try {
       await screen.findByText("Account A", { selector: "button" });
       expect(
-        screen.getByText("Automatic refresh paused: window inactive"),
+        screen.getByText("Background refresh on · Every 2 minutes"),
       ).toBeInTheDocument();
       fireEvent.change(screen.getByLabelText("Account"), {
         target: { value: "A" },
@@ -403,25 +432,40 @@ describe("Unified account analytics", () => {
         await vi.advanceTimersByTimeAsync(120000);
       });
       expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
+      expect(
+        vi.mocked(unifiedUsageApi.listAccounts).mock.calls.length,
+      ).toBeGreaterThan(1);
+      expect(
+        vi.mocked(unifiedUsageApi.syncStatus).mock.calls.length,
+      ).toBeGreaterThan(1);
+      const readsBeforeFocus = vi.mocked(unifiedUsageApi.listAccounts).mock
+        .calls.length;
       document.documentElement.dataset.windowActive = "true";
       fireEvent(
         window,
         new CustomEvent(WINDOW_ACTIVITY_EVENT, { detail: { active: true } }),
       );
       await waitFor(() =>
-        expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(2),
+        expect(
+          vi.mocked(unifiedUsageApi.listAccounts).mock.calls.length,
+        ).toBeGreaterThan(readsBeforeFocus),
       );
-      expect(
-        vi.mocked(unifiedUsageApi.sync).mock.calls.map(([id]) => id),
-      ).toEqual(["A", "B"]);
-      expect(
-        screen.getByText("Automatic refresh on · Every 2 minutes"),
-      ).toBeInTheDocument();
+      expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
       document.documentElement.dataset.windowActive = "false";
       await act(async () => {
         await vi.advanceTimersByTimeAsync(240000);
       });
-      expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(2);
+      expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
+      view.unmount();
+      const readsAfterUnmount = vi.mocked(unifiedUsageApi.syncStatus).mock.calls
+        .length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120000);
+      });
+      expect(unifiedUsageApi.syncStatus).toHaveBeenCalledTimes(
+        readsAfterUnmount,
+      );
+      expect(unifiedUsageApi.setSyncSettings).not.toHaveBeenCalled();
     } finally {
       view.unmount();
       delete document.documentElement.dataset.windowActive;
@@ -798,58 +842,136 @@ describe("Unified account analytics", () => {
     ).toBeInTheDocument();
   });
 
-  it("retries transient account errors at the configured interval and isolates failures from other accounts", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
-    const now = Date.parse("2026-11-05T00:00:00Z");
-    vi.setSystemTime(now);
-    const enabled = { syncIntervalMinutes: 5, lastSyncAt: now - 5 * 60_000 };
+  it("persists global background preferences through native settings and ignores old localStorage ownership", async () => {
+    localStorage.setItem("cc-switch.unified-usage.autoRefresh", "0");
     accounts = [
-      { ...makeAccount("A"), ...enabled, connectionStatus: "error" },
-      { ...makeAccount("B"), ...enabled },
-      ...["reauth_required", "unsupported", "disconnected", "pending"].map(
-        (status) => ({
-          ...makeAccount(status),
-          ...enabled,
-          connectionStatus: status,
-        }),
-      ),
-      {
-        ...makeAccount("unidentified"),
-        ...enabled,
-        connectionStatus: "error",
-        identity: null,
-      },
+      makeAccount("A"),
+      { ...makeAccount("B"), syncIntervalMinutes: 5 },
     ];
     dashboard.accounts = accounts;
-    vi.mocked(unifiedUsageApi.sync).mockImplementation(async (id) => {
-      if (id === "A") throw new Error("Transient transport failure for A");
-      return { accounts, errors: [] };
+    show();
+    const management = await openManagement();
+    const toggle = within(management).getByRole("switch");
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).toBeChecked();
+    expect(
+      within(management).getByText("Refresh schedule: Follow global"),
+    ).toBeInTheDocument();
+    expect(
+      within(management).getByText(
+        "Refresh schedule: 5 minutes · account override",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(management).getByText(
+        /including in the tray, on other pages, or unfocused/,
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(unifiedUsageApi.setSyncSettings).toHaveBeenLastCalledWith({
+        enabled: false,
+        intervalMinutes: 2,
+      }),
+    );
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    fireEvent.change(within(management).getByLabelText("Refresh frequency"), {
+      target: { value: "5" },
     });
-    const view = show();
-    try {
-      await screen.findByText("Account A", { selector: "button" });
-      await waitFor(() =>
-        expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(2),
-      );
-      expect(
-        vi.mocked(unifiedUsageApi.sync).mock.calls.map(([id]) => id),
-      ).toEqual(["A", "B"]);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(60_000);
-      });
-      expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(2);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(60_000);
-      });
-      await waitFor(() =>
-        expect(unifiedUsageApi.sync).toHaveBeenCalledTimes(4),
-      );
-      expect(
-        vi.mocked(unifiedUsageApi.sync).mock.calls.map(([id]) => id),
-      ).toEqual(["A", "B", "A", "B"]);
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
+    await waitFor(() =>
+      expect(unifiedUsageApi.setSyncSettings).toHaveBeenLastCalledWith({
+        enabled: false,
+        intervalMinutes: 5,
+      }),
+    );
+    expect(localStorage.getItem("cc-switch.unified-usage.autoRefresh")).toBe(
+      "0",
+    );
+    expect(
+      localStorage.getItem("cc-switch.unified-usage.autoRefreshMs"),
+    ).toBeNull();
+    expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
+  });
+
+  it("updates native background progress and completed data on an event without starting a new sync", async () => {
+    accounts = [makeAccount("A")];
+    dashboard.accounts = accounts;
+    backgroundSync = {
+      ...backgroundSync,
+      running: true,
+      lastAttemptAt: Date.parse("2026-11-05T12:00:00Z"),
+    };
+    show();
+    await screen.findByText("Synchronizing in background…");
+    const next = Date.parse("2026-11-05T12:02:00Z");
+    backgroundSync = {
+      ...backgroundSync,
+      running: false,
+      lastFinishedAt: next - 100000,
+      nextDueAt: next,
+    };
+    accounts = accounts.map((account) => ({
+      ...account,
+      lastSyncAt: next - 100000,
+    }));
+    await act(async () => {
+      emitTauriEvent("unified-usage-sync-updated", null);
+    });
+    expect(
+      await screen.findByText(
+        `Next background check: ${new Date(next).toLocaleString("zh")}`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        `Last sync finished: ${new Date(next - 100000).toLocaleString("zh")}`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Synchronizing in background…"),
+    ).not.toBeInTheDocument();
+    expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
+  });
+
+  it("keeps background controls disabled when persistent settings cannot be read", async () => {
+    vi.mocked(unifiedUsageApi.getSyncSettings).mockRejectedValue(
+      new Error("Native settings unavailable"),
+    );
+    show();
+    await screen.findByText("Background refresh settings unavailable");
+    const management = await openManagement();
+    expect(within(management).getByRole("switch")).toBeDisabled();
+    expect(
+      within(management).getByLabelText("Refresh frequency"),
+    ).toBeDisabled();
+    expect(unifiedUsageApi.setSyncSettings).not.toHaveBeenCalled();
+    expect(unifiedUsageApi.sync).not.toHaveBeenCalled();
+  });
+
+  it("shows an already-running native batch without claiming a new successful check", async () => {
+    accounts = [
+      { ...makeAccount("A"), lastSyncAt: Date.parse("2026-11-05T12:00:00Z") },
+    ];
+    dashboard.accounts = accounts;
+    vi.mocked(unifiedUsageApi.sync).mockImplementation(async () => {
+      backgroundSync = { ...backgroundSync, running: true };
+      return { accounts, errors: [], alreadyRunning: true };
+    });
+    show();
+    await screen.findByText("Account A", { selector: "button" });
+    fireEvent.click(screen.getByRole("button", { name: "Sync now" }));
+    expect(
+      await screen.findByText("Synchronizing in background…"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        `All-account last successful check: ${new Date(accounts[0].lastSyncAt!).toLocaleString("zh")}`,
+      ),
+    ).toBeInTheDocument();
+    expect(unifiedUsageApi.sync).toHaveBeenCalledOnce();
+    expect(unifiedUsageApi.sync).toHaveBeenCalledWith(undefined);
+    expect(
+      screen.queryByText("Some data could not be updated"),
+    ).not.toBeInTheDocument();
   });
 });

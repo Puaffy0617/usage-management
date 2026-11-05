@@ -2880,8 +2880,14 @@ fn build_windows_tool_command(
     tool_path: &Path,
     args: &[&str],
     new_path: &str,
-) -> std::process::Command {
+) -> std::io::Result<std::process::Command> {
     use std::process::Command;
+
+    if crate::services::quiet_codex::is_codex_entry(tool_path) {
+        // npm's hidden Node launcher starts a new visible native console. Run
+        // the verified same-installation native entry instead, or fail quietly.
+        return crate::services::quiet_codex::native_command(tool_path, args, new_path);
+    }
 
     if is_windows_command_script(tool_path) {
         // `resolve_path_default` returns a canonical path so callers can
@@ -2910,14 +2916,14 @@ fn build_windows_tool_command(
             .raw_arg(&command)
             .env("PATH", new_path)
             .creation_flags(CREATE_NO_WINDOW);
-        return cmd;
+        return Ok(cmd);
     }
 
     let mut cmd = Command::new(tool_path);
     cmd.args(args)
         .env("PATH", new_path)
         .creation_flags(CREATE_NO_WINDOW);
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(target_os = "windows")]
@@ -2926,7 +2932,7 @@ fn run_windows_tool_command(
     args: &[&str],
     new_path: &str,
 ) -> std::io::Result<std::process::Output> {
-    build_windows_tool_command(tool_path, args, new_path).output()
+    build_windows_tool_command(tool_path, args, new_path)?.output()
 }
 
 #[cfg(target_os = "windows")]
@@ -3369,7 +3375,8 @@ fn run_probe_version_command(
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
 
-    let mut cmd = build_windows_tool_command(tool_path, &["--version"], new_path);
+    let mut cmd = build_windows_tool_command(tool_path, &["--version"], new_path)
+        .map_err(|error| error.to_string())?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4638,7 +4645,7 @@ pub(crate) fn detected_tool_command(
     #[cfg(target_os = "windows")]
     {
         let new_path = format!("{};{}", dir.display(), effective_path_string());
-        Ok(build_windows_tool_command(&tool_path, args, &new_path))
+        build_windows_tool_command(&tool_path, args, &new_path).map_err(|error| error.to_string())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -4669,7 +4676,8 @@ fn run_windows_tool_command_capture(
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
 
-    let mut cmd = build_windows_tool_command(tool_path, args, new_path);
+    let mut cmd =
+        build_windows_tool_command(tool_path, args, new_path).map_err(|error| error.to_string())?;
     apply_extra_env(&mut cmd, extra_env);
     cmd.current_dir(working_dir)
         .stdout(Stdio::piped())
@@ -11799,8 +11807,8 @@ mod tests {
     #[test]
     fn run_windows_tool_version_command_accepts_canonicalized_cmd_path() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let cmd = dir.path().join("codex.cmd");
-        std::fs::write(&cmd, "@echo off\r\necho codex-cli 0.144.3\r\n")
+        let cmd = dir.path().join("gemini.cmd");
+        std::fs::write(&cmd, "@echo off\r\necho helper-cli 0.144.3\r\n")
             .expect("cmd shim should be created");
         let canonical = std::fs::canonicalize(&cmd).expect("cmd shim should canonicalize");
         assert!(
@@ -11817,7 +11825,7 @@ mod tests {
         assert!(output.status.success(), "cmd shim failed: {stderr}");
         assert_eq!(
             decode_command_output(&output.stdout).trim(),
-            "codex-cli 0.144.3"
+            "helper-cli 0.144.3"
         );
     }
 

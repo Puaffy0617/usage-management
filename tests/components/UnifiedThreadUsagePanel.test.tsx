@@ -1,8 +1,9 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UnifiedThreadUsagePanel } from "@/components/usage/UnifiedThreadUsagePanel";
 import { unifiedUsageApi } from "@/lib/api/unifiedUsage";
+import { summarizeThreadUsage } from "@/components/usage/unifiedThreadUsageData";
 import type {
   AnalyticsAccount,
   ThreadUsageDashboard,
@@ -235,5 +236,81 @@ describe("separate official thread lifetime snapshots", () => {
     expect(await screen.findByText("<¥0.01")).toBeInTheDocument();
     expect(screen.getAllByText("<$0.01")).toHaveLength(2);
     expect(screen.getByText("$0.00")).toBeInTheDocument();
+  });
+
+  it("shows a compact first-fold monetary and exact-token subtotal with the same shared-thread exclusions as the full table", async () => {
+    data = {
+      records: [
+        record("A", "shared-thread", 1_000_000),
+        record("B", "shared-thread", 1_000_000),
+        record("A", "unique-thread", 2_000_000),
+      ],
+      candidateCount: 2,
+    };
+    const view = show();
+    await screen.findByText("¥14.00 *");
+    const jump = vi.fn();
+    view.rerender(
+      <UnifiedThreadUsagePanel
+        accounts={[account("A"), account("B")]}
+        compact
+        onViewDetails={jump}
+      />,
+    );
+    const summary = screen.getByRole("region", {
+      name: "Official discovered threads · Lifetime subtotal",
+    });
+    expect(within(summary).getByText("¥14.00 *")).toBeInTheDocument();
+    expect(within(summary).getByText("130 *")).toBeInTheDocument();
+    fireEvent.click(
+      within(summary).getByRole("button", {
+        name: "View thread amounts and details",
+      }),
+    );
+    expect(jump).toHaveBeenCalledOnce();
+    view.rerender(
+      <UnifiedThreadUsagePanel
+        accounts={[account("A"), account("B")]}
+        accountId="A"
+        compact
+      />,
+    );
+    expect(await screen.findByText("¥21.00")).toBeInTheDocument();
+    expect(screen.getByText("260")).toBeInTheDocument();
+    expect(
+      screen.getByText(/snapshot is shown for accessibility only/),
+    ).toBeInTheDocument();
+  });
+
+  it("uses only explicit reported totalTokens for compact tokens and leaves CNY unavailable without FX", async () => {
+    const missingTotal = record("A", "no-total-thread", 1_000_000);
+    missingTotal.snapshot!.groups[0].totalTokens = null;
+    data = {
+      records: [record("A", "known-total-thread", 2_000_000), missingTotal],
+      candidateCount: 2,
+    };
+    pricing.usdToCny = null;
+    const view = show();
+    await screen.findByText("no-total-thread");
+    view.rerender(
+      <UnifiedThreadUsagePanel accounts={[account("A")]} compact />,
+    );
+    expect(screen.getByText("$3.00")).toBeInTheDocument();
+    expect(screen.getByText("130 *")).toBeInTheDocument();
+    expect(
+      screen.getByText(/CNY conversion requires a real exchange rate/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("260")).not.toBeInTheDocument();
+  });
+
+  it("does not round an unsafe combined thread-token total", () => {
+    const one = record("A", "one", 1_000_000),
+      two = record("B", "two", 1_000_000);
+    one.snapshot!.groups[0].totalTokens = Number.MAX_SAFE_INTEGER;
+    two.snapshot!.groups[0].totalTokens = 1;
+    const summary = summarizeThreadUsage([one, two]);
+    expect(summary.tokens).toBeNull();
+    expect(summary.tokensPartial).toBe(true);
+    expect(summary.usd).toBe(2);
   });
 });

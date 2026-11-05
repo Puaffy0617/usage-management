@@ -5,6 +5,8 @@ import type {
   AnalyticsFilter,
   AnalyticsImportFormat,
   AnalyticsLogin,
+  AnalyticsSyncSettings,
+  AnalyticsBackgroundSyncStatus,
   ThreadUsageDashboard,
 } from "@/types/unifiedUsage";
 
@@ -40,14 +42,23 @@ export const unifiedUsageApi = {
   cancelLogin: (accountId: string, loginId: string) =>
     invoke<void>("unified_usage_cancel_login", { accountId, loginId }),
   sync: (accountId?: string) =>
-    invoke<{ accounts: AnalyticsAccount[]; errors: string[] }>(
-      "unified_usage_sync",
-      { accountId },
-    ),
+    invoke<{
+      accounts: AnalyticsAccount[];
+      errors: string[];
+      alreadyRunning?: boolean;
+    }>("unified_usage_sync", { accountId }),
   dashboard: (filter: AnalyticsFilter) =>
     invoke<AnalyticsDashboard>("unified_usage_dashboard", { filter }),
   threadDashboard: () =>
     invoke<ThreadUsageDashboard>("unified_usage_thread_dashboard"),
+  getSyncSettings: () =>
+    invoke<AnalyticsSyncSettings>("unified_usage_get_sync_settings"),
+  setSyncSettings: (settings: AnalyticsSyncSettings) =>
+    invoke<AnalyticsSyncSettings>("unified_usage_set_sync_settings", {
+      settings,
+    }),
+  syncStatus: () =>
+    invoke<AnalyticsBackgroundSyncStatus>("unified_usage_sync_status"),
   import: (accountId: string, path: string, format: AnalyticsImportFormat) =>
     invoke<{ imported: number; skipped: number; warnings: string[] }>(
       "unified_usage_import",

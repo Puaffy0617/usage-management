@@ -3,24 +3,28 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { unifiedUsageApi } from "@/lib/api/unifiedUsage";
 import { useUnifiedUsagePricing } from "@/hooks/useUnifiedUsagePricing";
+import { Button } from "@/components/ui/button";
 import type { AnalyticsAccount, ThreadUsageRecord } from "@/types/unifiedUsage";
 import {
   formatAnalyticsTimestamp,
   formatApiEquivalentCny,
-  safeMetricSum,
 } from "./unifiedUsageData";
-
-function measured(value: number | null | undefined): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
+import {
+  reportedThreadCounter as measured,
+  summarizeThreadUsage,
+} from "./unifiedThreadUsageData";
 
 /** This independent lifetime view never contributes to the dated usage cards. */
 export function UnifiedThreadUsagePanel({
   accounts,
   accountId = "",
+  compact = false,
+  onViewDetails,
 }: {
   accounts: AnalyticsAccount[];
   accountId?: string;
+  compact?: boolean;
+  onViewDetails?: () => void;
 }) {
   const { t, i18n } = useTranslation();
   const tx = (key: string, defaultValue: string) =>
@@ -29,32 +33,23 @@ export function UnifiedThreadUsagePanel({
   const query = useQuery({
     queryKey: ["unified-usage", "threads"],
     queryFn: () => unifiedUsageApi.threadDashboard(),
+    // The compact observer shares the full table's cache and read-only timer.
+    refetchInterval: compact ? false : 30_000,
+    refetchIntervalInBackground: false,
     retry: false,
   });
   const pricing = useUnifiedUsagePricing();
-  const all = query.data?.records ?? [];
   // Authentication proves accessibility, not billing ownership. Detect shared
   // threads before applying any display filter so it cannot hide ambiguity.
-  const contexts = new Map<string, Set<string>>();
-  for (const record of all) {
-    if (!record.snapshot) continue;
-    const owners = contexts.get(record.threadId) ?? new Set<string>();
-    owners.add(record.accountId);
-    contexts.set(record.threadId, owners);
-  }
-  const ambiguous = (record: ThreadUsageRecord) =>
-    (contexts.get(record.threadId)?.size ?? 0) > 1;
-  const records = all.filter(
-    (record) => !accountId || record.accountId === accountId,
-  );
-  const included = records.filter(
-    (record) => record.snapshot && (accountId || !ambiguous(record)),
-  );
-  const amounts = included
-    .map((record) => record.snapshot!.estimatedUsageUsdMicros)
-    .filter(measured);
-  const micros = amounts.length ? safeMetricSum(amounts) : null;
-  const usd = micros === null ? null : micros / 1_000_000;
+  const {
+    records,
+    ambiguous,
+    usd,
+    partial,
+    tokens,
+    tokensPartial,
+    hasAmbiguity,
+  } = summarizeThreadUsage(query.data?.records ?? [], accountId);
   const converted =
     usd !== null && pricing.usdToCny !== null ? usd * pricing.usdToCny : null;
   const cny =
@@ -64,10 +59,6 @@ export function UnifiedThreadUsagePanel({
     (usd === 0 || converted > 0)
       ? converted
       : null;
-  const partial =
-    amounts.length !== records.length ||
-    records.some((record) => record.status !== "available");
-  const hasAmbiguity = records.some(ambiguous);
   const count = (value: number | null | undefined) =>
     measured(value) ? value.toLocaleString(locale) : "—";
   const dollars = (value: number | null) =>
@@ -94,6 +85,103 @@ export function UnifiedThreadUsagePanel({
         : record.status === "unavailable"
           ? tx("unavailable", "No supported thread snapshot returned")
           : tx("error", "Latest check failed");
+
+  if (compact)
+    return (
+      <section
+        aria-label={tx(
+          "summaryTitle",
+          "Official discovered threads · Lifetime subtotal",
+        )}
+        className="shrink-0 rounded-panel border border-border bg-surface px-4 py-3"
+      >
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-caption text-fg-2">
+          <h2 className="text-body font-semibold text-fg-1">
+            {tx(
+              "summaryTitle",
+              "Official discovered threads · Lifetime subtotal",
+            )}
+          </h2>
+          <span>
+            {tx("serverEstimate", "Server-reported USD estimate")}:{" "}
+            <strong className="tabular-nums text-fg-1">
+              {dollars(usd)}
+              {partial && usd !== null ? " *" : ""}
+            </strong>
+          </span>
+          <span>
+            {tx("cnyEquivalent", "CNY conversion")}:{" "}
+            <strong className="tabular-nums text-fg-1">
+              {formatApiEquivalentCny(cny, locale)}
+              {partial && cny !== null ? " *" : ""}
+            </strong>
+            {pricing.fx.status === "stale"
+              ? ` · ${tx("staleFx", "Previous exchange rate")}`
+              : ""}
+          </span>
+          <span title={count(tokens)}>
+            {tx("reportedThreadTokens", "Reported thread tokens")}:{" "}
+            <strong className="tabular-nums text-fg-1">
+              {count(tokens)}
+              {tokensPartial && tokens !== null ? " *" : ""}
+            </strong>
+          </span>
+          {onViewDetails && (
+            <Button
+              variant="quiet"
+              size="compact"
+              className="ms-auto"
+              onClick={onViewDetails}
+            >
+              {tx("viewDetails", "View thread amounts and details")}
+            </Button>
+          )}
+        </div>
+        <p className="mt-1.5 text-caption text-fg-3">
+          {tx(
+            "summaryScope",
+            "Partial lifetime snapshots only; separate from the daily token total below and not a complete account bill. * marks unavailable, stale or excluded snapshots.",
+          )}
+        </p>
+        {hasAmbiguity && (
+          <p className="mt-1 text-caption text-warning-text">
+            {accountId
+              ? tx(
+                  "accessibleWarning",
+                  "This account can access a thread also visible to another account. Its snapshot is shown for accessibility only; billing ownership is unverified.",
+                )
+              : tx(
+                  "ambiguousWarning",
+                  "Threads visible under multiple accounts are excluded from the combined USD subtotal. Their snapshots remain visible below; billing ownership is unverified.",
+                )}
+          </p>
+        )}
+        {usd !== null && pricing.usdToCny === null && (
+          <p className="mt-1 text-caption text-fg-3">
+            {tx(
+              "noFx",
+              "The reported USD estimate is available; CNY conversion requires a real exchange rate.",
+            )}
+          </p>
+        )}
+        {usd === null && (
+          <p className="mt-1 text-caption text-fg-3">
+            {query.isLoading
+              ? tx("loading", "Reading stored thread snapshots…")
+              : tx(
+                  "summaryUnavailable",
+                  "No unambiguous server-reported thread USD subtotal is available for this selection. Unsupported or inaccessible snapshots remain unavailable, not zero.",
+                )}
+          </p>
+        )}
+        {query.error && (
+          <p className="mt-1 text-caption text-warning-text">
+            {tx("readError", "Stored thread snapshots could not be read")}:{" "}
+            {String(query.error)}
+          </p>
+        )}
+      </section>
+    );
 
   return (
     <section

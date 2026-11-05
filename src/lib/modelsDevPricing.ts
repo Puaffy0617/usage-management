@@ -169,6 +169,14 @@ const COMMON_FAMILY_RULES: CommonFamilyRule[] = [
   },
 ];
 
+export function isCanonicalPricingEntry(entry: ModelsDevEntry): boolean {
+  return COMMON_FAMILY_RULES.some(
+    (rule) =>
+      rule.providers.has(entry.providerId) &&
+      rule.matches(entry.modelId.toLowerCase()),
+  );
+}
+
 /** Pick a bounded, canonical set of recent chat/coding models per family. */
 export function getCommonModelKeys(entries: ModelsDevEntry[]): Set<string> {
   const keys = new Set<string>();

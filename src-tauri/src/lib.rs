@@ -1331,10 +1331,12 @@ pub fn run() {
                 app.manage(CodexOAuthState(codex_oauth_manager));
                 log::info!("✓ CodexOAuthManager initialized");
                 let analytics_state=app.state::<AppState>().inner().clone();
+                let analytics_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error)=commands::unified_usage_reconcile_original_metadata(&analytics_state).await {
                         log::warn!("Analytics account discovery did not finish: {error}");
                     }
+                    commands::unified_usage_start_background_sync(analytics_state, analytics_app);
                 });
             }
 
@@ -1860,6 +1862,9 @@ pub fn run() {
             commands::unified_usage_sync,
             commands::unified_usage_dashboard,
             commands::unified_usage_thread_dashboard,
+            commands::unified_usage_get_sync_settings,
+            commands::unified_usage_set_sync_settings,
+            commands::unified_usage_sync_status,
             commands::unified_usage_import,
             commands::unified_usage_export,
             commands::get_usage_summary,

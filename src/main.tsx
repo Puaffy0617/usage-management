@@ -26,6 +26,7 @@ import {
 import {
   MODELS_DEV_SYNC_CONFIG_QUERY_KEY,
   syncModelsDevPricingOnStartup,
+  startModelsDevPricingBackground,
 } from "./lib/modelsDevAutoSync";
 import { initializeWindowActivity } from "@/lib/windowActivity";
 import { initializeInputModality } from "@/lib/inputModality";
@@ -152,24 +153,29 @@ async function bootstrap() {
     </React.StrictMode>,
   );
 
-  void syncModelsDevPricingOnStartup()
-    .then((result) => {
-      if (!result.skipped) {
-        return Promise.all([
-          queryClient.invalidateQueries({ queryKey: ["usage"] }),
-          queryClient.invalidateQueries({
-            queryKey: MODELS_DEV_SYNC_CONFIG_QUERY_KEY,
-          }),
-        ]);
-      }
-    })
-    .catch((error) => {
-      // 离线或 models.dev 暂时不可用不应阻塞应用启动。
-      reportFrontendError("models_dev_startup_sync", error);
-      void queryClient.invalidateQueries({
-        queryKey: MODELS_DEV_SYNC_CONFIG_QUERY_KEY,
-      });
+  const pricingUpdated = async (
+    result: Awaited<ReturnType<typeof syncModelsDevPricingOnStartup>>,
+  ): Promise<void> => {
+    if (!result.skipped) {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["usage"] }),
+        queryClient.invalidateQueries({
+          queryKey: MODELS_DEV_SYNC_CONFIG_QUERY_KEY,
+        }),
+      ]);
+    }
+  };
+  const pricingFailed = (error: unknown) => {
+    // 离线或 models.dev 暂时不可用不应阻塞应用启动。
+    reportFrontendError("models_dev_startup_sync", error);
+    void queryClient.invalidateQueries({
+      queryKey: MODELS_DEV_SYNC_CONFIG_QUERY_KEY,
     });
+  };
+  void syncModelsDevPricingOnStartup()
+    .then(pricingUpdated)
+    .catch(pricingFailed);
+  startModelsDevPricingBackground(pricingUpdated, pricingFailed);
 }
 
 void bootstrap();

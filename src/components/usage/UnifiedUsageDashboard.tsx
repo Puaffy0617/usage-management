@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import {
   ChartColumn,
   Download,
@@ -46,6 +47,8 @@ import type {
   AnalyticsAccount,
   AnalyticsImportFormat,
   AnalyticsLogin,
+  AnalyticsSyncSettings,
+  AnalyticsBackgroundSyncStatus,
   UsageBucket,
 } from "@/types/unifiedUsage";
 import {
@@ -55,6 +58,7 @@ import {
 } from "./unifiedUsageData";
 
 const QUERY_KEY = ["unified-usage"] as const;
+const READ_POLL_MS = 30_000;
 const COLORS = [
   "var(--chart-1)",
   "var(--chart-2)",
@@ -70,13 +74,6 @@ const PROVENANCE_RANK = new Map([
   ["local", 1],
   ["estimated", 2],
 ]);
-
-function windowPauseReason() {
-  if (document.visibilityState === "hidden") return "hidden";
-  if (document.documentElement.dataset.windowActive === "false")
-    return "inactive";
-  return null;
-}
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -284,30 +281,10 @@ export function UnifiedUsageDashboard({
     useState<UnifiedOverviewMetric>("tokens");
   const [tab, setTab] = useState<"accounts" | "models" | "details">("accounts");
   const [manageOpen, setManageOpen] = useState(false);
+  const threadDetailsRef = useRef<HTMLDivElement>(null);
   const [detailPage, setDetailPage] = useState(0);
-  const [autoRefresh, setAutoRefresh] = useState(() => {
-    try {
-      return (
-        localStorage.getItem("cc-switch.unified-usage.autoRefresh") !== "0"
-      );
-    } catch {
-      return true;
-    }
-  });
-  const [autoRefreshMs, setAutoRefreshMs] = useState(() => {
-    try {
-      const value = Number(
-        localStorage.getItem("cc-switch.unified-usage.autoRefreshMs"),
-      );
-      return [60000, 120000, 300000].includes(value) ? value : 120000;
-    } catch {
-      return 120000;
-    }
-  });
   const [busy, setBusy] = useState(false);
-  const [pauseReason, setPauseReason] = useState(windowPauseReason);
   const busyRef = useRef(false);
-  const lastAutoAttemptAt = useRef(new Map<string, number>());
   const [error, setError] = useState<string | null>(null);
   const [importNotice, setImportNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState<AnalyticsAccount | "new" | null>(null);
@@ -323,9 +300,25 @@ export function UnifiedUsageDashboard({
   >(null);
   const loginRef = useRef<typeof login>(null);
 
+  const syncSettingsQuery = useQuery({
+    queryKey: [...QUERY_KEY, "sync-settings"],
+    queryFn: () => unifiedUsageApi.getSyncSettings(),
+    retry: false,
+  });
+  const syncStatusQuery = useQuery({
+    queryKey: [...QUERY_KEY, "sync-status"],
+    queryFn: () => unifiedUsageApi.syncStatus(),
+    refetchInterval: READ_POLL_MS,
+    refetchIntervalInBackground: false,
+    retry: false,
+  });
+  const syncSettings = syncSettingsQuery.data;
+  const backgroundSync = syncStatusQuery.data;
   const accountsQuery = useQuery({
     queryKey: [...QUERY_KEY, "accounts"],
     queryFn: unifiedUsageApi.listAccounts,
+    refetchInterval: READ_POLL_MS,
+    refetchIntervalInBackground: false,
     retry: false,
   });
   const accounts = accountsQuery.data ?? [];
@@ -336,6 +329,8 @@ export function UnifiedUsageDashboard({
   const baseQuery = useQuery({
     queryKey: [...QUERY_KEY, "dashboard", baseFilter],
     queryFn: () => unifiedUsageApi.dashboard(baseFilter),
+    refetchInterval: READ_POLL_MS,
+    refetchIntervalInBackground: false,
     retry: false,
   });
   const hasDimensions = Boolean(model || platform || feature);
@@ -349,6 +344,8 @@ export function UnifiedUsageDashboard({
     queryKey: [...QUERY_KEY, "dashboard", scopedFilter],
     queryFn: () => unifiedUsageApi.dashboard(scopedFilter),
     enabled: hasDimensions,
+    refetchInterval: READ_POLL_MS,
+    refetchIntervalInBackground: false,
     retry: false,
   });
   const activeQuery = hasDimensions ? scopedQuery : baseQuery;
@@ -493,68 +490,46 @@ export function UnifiedUsageDashboard({
     }
   };
   const sync = async (id?: string) => {
-    const targets = id
-      ? accounts.filter((account) => account.id === id)
-      : accounts;
-    for (const target of targets)
-      lastAutoAttemptAt.current.set(target.id, Date.now());
     const result = await unifiedUsageApi.sync(id);
     queryClient.setQueryData([...QUERY_KEY, "accounts"], result.accounts);
+    if (result.alreadyRunning)
+      queryClient.setQueryData<AnalyticsBackgroundSyncStatus>(
+        [...QUERY_KEY, "sync-status"],
+        (previous) => (previous ? { ...previous, running: true } : previous),
+      );
     if (result.errors.length) setError(result.errors.join("\n"));
   };
+  const saveSyncSettings = (settings: AnalyticsSyncSettings) =>
+    run(async () => {
+      const saved = await unifiedUsageApi.setSyncSettings(settings);
+      queryClient.setQueryData([...QUERY_KEY, "sync-settings"], saved);
+    });
 
-  // Only opted-in, due accounts synchronize while this page is visible.
-  // A timer is not a second collector and stops when the page is unmounted.
+  // Collection belongs to the native worker. Renderer activity only refreshes
+  // stored results; it never starts another automatic collector.
   useEffect(() => {
-    const synchronizeDueAccounts = async () => {
-      const paused = windowPauseReason();
-      setPauseReason(paused);
-      if (!autoRefresh || busyRef.current || paused !== null) return;
-      const now = Date.now();
-      const due = accounts.filter(
-        (account) =>
-          ["connected", "error"].includes(account.connectionStatus) &&
-          account.identity !== null &&
-          now -
-            Math.max(
-              account.lastSyncAt ?? 0,
-              lastAutoAttemptAt.current.get(account.id) ?? 0,
-            ) >=
-            autoRefreshMs,
-      );
-      if (!due.length) return;
-      await run(async () => {
-        for (const account of due) {
-          // Record attempts before awaiting: a transient failure must wait for
-          // the configured interval, while other accounts can still refresh.
-          lastAutoAttemptAt.current.set(account.id, Date.now());
-          try {
-            await sync(account.id);
-          } catch (cause) {
-            setError((previous) =>
-              [previous, String(cause)].filter(Boolean).join("\n"),
-            );
-          }
-        }
-      });
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const refreshStoredResults = () => {
+      if (
+        document.visibilityState !== "hidden" &&
+        document.documentElement.dataset.windowActive !== "false"
+      )
+        void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     };
-    void synchronizeDueAccounts();
-    const resume = () => void synchronizeDueAccounts();
-    window.addEventListener("focus", resume);
-    window.addEventListener("blur", resume);
-    window.addEventListener(WINDOW_ACTIVITY_EVENT, resume);
-    document.addEventListener("visibilitychange", resume);
-    const timer = window.setInterval(resume, 60_000);
+    window.addEventListener(WINDOW_ACTIVITY_EVENT, refreshStoredResults);
+    void listen("unified-usage-sync-updated", refreshStoredResults)
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
     return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", resume);
-      window.removeEventListener("blur", resume);
-      window.removeEventListener(WINDOW_ACTIVITY_EVENT, resume);
-      document.removeEventListener("visibilitychange", resume);
+      disposed = true;
+      unlisten?.();
+      window.removeEventListener(WINDOW_ACTIVITY_EVENT, refreshStoredResults);
     };
-    // Account metadata is refreshed after each synchronization, including failures.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, autoRefresh, autoRefreshMs]);
+  }, [queryClient]);
 
   useEffect(
     () => () => {
@@ -660,7 +635,11 @@ export function UnifiedUsageDashboard({
       );
     });
 
-  const queryError = accountsQuery.error ?? activeQuery.error;
+  const queryError =
+    accountsQuery.error ??
+    activeQuery.error ??
+    syncSettingsQuery.error ??
+    syncStatusQuery.error;
   const dimensionOptions = (dimension: "model" | "platform" | "feature") =>
     [
       ...new Set(
@@ -747,6 +726,12 @@ export function UnifiedUsageDashboard({
                       {tx("lastSync", "Last sync")}:{" "}
                       {formatAnalyticsTimestamp(account.lastSyncAt, locale) ??
                         tx("never", "Never")}
+                    </p>
+                    <p className="mt-1 text-caption text-fg-3">
+                      {tx("accountSchedule", "Refresh schedule")}:{" "}
+                      {account.syncIntervalMinutes > 0
+                        ? `${number(account.syncIntervalMinutes)} ${tx("minutes", "minutes")} · ${tx("accountOverride", "account override")}`
+                        : tx("followGlobal", "Follow global")}
                     </p>
                     {account.lastError && (
                       <p className="mt-2 break-words text-caption text-warning-text">
@@ -854,18 +839,28 @@ export function UnifiedUsageDashboard({
     .sort()
     .at(-1);
   const frequency =
-    autoRefreshMs === 60000
+    syncSettings?.intervalMinutes === 1
       ? tx("everyMinute", "Every minute")
-      : autoRefreshMs === 300000
+      : syncSettings?.intervalMinutes === 5
         ? tx("everyFiveMinutes", "Every 5 minutes")
         : tx("everyTwoMinutes", "Every 2 minutes");
-  const autoRefreshStatus = !autoRefresh
-    ? tx("autoRefreshOff", "Automatic refresh off")
-    : pauseReason === "hidden"
-      ? tx("autoRefreshHidden", "Automatic refresh paused: page hidden")
-      : pauseReason === "inactive"
-        ? tx("autoRefreshInactive", "Automatic refresh paused: window inactive")
-        : `${tx("autoRefreshOn", "Automatic refresh on")} · ${frequency}`;
+  const autoRefreshStatus = !syncSettings
+    ? syncSettingsQuery.error
+      ? tx(
+          "backgroundSettingsUnavailable",
+          "Background refresh settings unavailable",
+        )
+      : tx("backgroundSettingsLoading", "Reading background refresh settings…")
+    : !syncSettings.enabled
+      ? tx("backgroundRefreshOff", "Background refresh off")
+      : `${tx("backgroundRefreshOn", "Background refresh on")} · ${frequency}`;
+  const recentSyncAt = backgroundSync?.running
+    ? backgroundSync.lastAttemptAt
+    : (backgroundSync?.lastFinishedAt ?? backgroundSync?.lastAttemptAt);
+  const recentSyncLabel =
+    !backgroundSync?.running && backgroundSync?.lastFinishedAt
+      ? tx("syncLastFinished", "Last sync finished")
+      : tx("backgroundLastAttempt", "Last sync attempt");
   const officialTokenTotalsOnly =
     families.find((family) => family.key === familyKey)?.provenance ===
       "official" &&
@@ -1007,6 +1002,17 @@ export function UnifiedUsageDashboard({
       >
         <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span>{autoRefreshStatus}</span>
+          {backgroundSync?.running && (
+            <span>
+              {tx("backgroundRunning", "Synchronizing in background…")}
+            </span>
+          )}
+          {recentSyncAt && (
+            <span>{`${recentSyncLabel}: ${formatAnalyticsTimestamp(recentSyncAt, locale)}`}</span>
+          )}
+          {syncSettings?.enabled && backgroundSync?.nextDueAt && (
+            <span>{`${tx("backgroundNextDue", "Next background check")}: ${formatAnalyticsTimestamp(backgroundSync.nextDueAt, locale)}`}</span>
+          )}
           <span>
             {tx("refreshAccountCount", "Accounts eligible for refresh")}:{" "}
             {refreshableAccounts.length}
@@ -1091,6 +1097,17 @@ export function UnifiedUsageDashboard({
             </div>
           </div>
         )}
+        <UnifiedThreadUsagePanel
+          accounts={accounts}
+          accountId={accountId}
+          compact
+          onViewDetails={() =>
+            threadDetailsRef.current?.scrollIntoView({
+              block: "start",
+              behavior: "smooth",
+            })
+          }
+        />
         <UnifiedUsageOverview
           total={{
             cost: report.total.cny,
@@ -1436,7 +1453,9 @@ export function UnifiedUsageDashboard({
             )}
           </div>
         </section>
-        <UnifiedThreadUsagePanel accounts={accounts} accountId={accountId} />
+        <div className="shrink-0" ref={threadDetailsRef}>
+          <UnifiedThreadUsagePanel accounts={accounts} accountId={accountId} />
+        </div>
         <p className="text-caption text-fg-3">
           {tx(
             "compactCoverage",
@@ -1459,49 +1478,47 @@ export function UnifiedUsageDashboard({
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-control bg-subtle p-3">
               <label className="flex items-center gap-2 text-body text-fg-2">
                 <Switch
-                  checked={autoRefresh}
+                  checked={syncSettings?.enabled ?? true}
+                  disabled={busy || !syncSettings}
                   onCheckedChange={(enabled) => {
-                    setAutoRefresh(enabled);
-                    try {
-                      localStorage.setItem(
-                        "cc-switch.unified-usage.autoRefresh",
-                        enabled ? "1" : "0",
-                      );
-                    } catch {}
+                    if (syncSettings)
+                      void saveSyncSettings({ ...syncSettings, enabled });
                   }}
                 />
-                {tx("autoRefreshAll", "Auto-refresh all connected accounts")}
+                {tx(
+                  "backgroundRefreshAll",
+                  "Refresh all connected accounts in background",
+                )}
               </label>
               <select
                 aria-label={tx("refreshFrequency", "Refresh frequency")}
                 className={SELECT}
-                value={autoRefreshMs}
+                value={syncSettings?.intervalMinutes ?? 2}
+                disabled={busy || !syncSettings}
                 onChange={(event) => {
-                  const value = Number(event.target.value);
-                  setAutoRefreshMs(value);
-                  try {
-                    localStorage.setItem(
-                      "cc-switch.unified-usage.autoRefreshMs",
-                      String(value),
-                    );
-                  } catch {}
+                  const value = Number(
+                    event.target.value,
+                  ) as AnalyticsSyncSettings["intervalMinutes"];
+                  if (syncSettings)
+                    void saveSyncSettings({
+                      ...syncSettings,
+                      intervalMinutes: value,
+                    });
                 }}
               >
-                <option value={60000}>
-                  {tx("everyMinute", "Every minute")}
-                </option>
-                <option value={120000}>
+                <option value={1}>{tx("everyMinute", "Every minute")}</option>
+                <option value={2}>
                   {tx("everyTwoMinutes", "Every 2 minutes")}
                 </option>
-                <option value={300000}>
+                <option value={5}>
                   {tx("everyFiveMinutes", "Every 5 minutes")}
                 </option>
               </select>
             </div>
             <p className="text-caption text-fg-3">
               {tx(
-                "autoRefreshScope",
-                "Refresh is enabled by default while this page is open, visible, and focused. It always covers all connected accounts, independently of display filters.",
+                "backgroundRefreshScope",
+                "Enabled by default while the application is running, including in the tray, on other pages, or unfocused. All connected accounts are refreshed independently of display filters. Fully quitting the app stops refresh; no system background service is installed.",
               )}
             </p>
             <div className="flex flex-wrap gap-2">

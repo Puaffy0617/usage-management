@@ -91,7 +91,15 @@ pub mod unified_usage_threads;
 #[path = "../../../src-tauri/src/services/unified_usage_thread_store.rs"]
 pub mod unified_usage_thread_store;
 
+#[path = "../../../src-tauri/src/services/unified_usage_sync.rs"]
+pub mod unified_usage_sync;
+
+#[path = "../../../src-tauri/src/services/quiet_codex.rs"]
+pub mod quiet_codex;
+
 pub mod services {
+    pub use crate::quiet_codex;
+    pub use crate::unified_usage_sync;
     pub use crate::unified_usage_thread_store;
     pub use crate::unified_usage_threads;
 }

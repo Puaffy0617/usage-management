@@ -1,5 +1,7 @@
 > **多账号用量统计定制版：** 本仓库为 [Puaffy0617/usage-management](https://github.com/Puaffy0617/usage-management)，基于 CC Switch，增加多个已保存账号的用量统计和独立签名更新通道。请使用本仓库的[定制版发布包](https://github.com/Puaffy0617/usage-management/releases)，并参阅[使用说明](docs/unified-usage.md)及[更新说明](docs/hosted-releases.md)。下方原项目信息和下载链接属于上游 CC Switch。
 
+账号同步由单个原生后台任务负责：CC Switch 保持运行时，切换页面、最小化或驻留托盘仍会刷新。默认每两分钟一次，可在账号管理中关闭或改为每一/二/五分钟；账号间隔为零时跟随全局，已有正数间隔继续覆盖全局。退出应用后任务停止，不安装系统常驻服务，也不会自动登录或退出账号。详见[刷新与数据覆盖说明](docs/unified-usage-costs.md)。
+
 <div align="center">
 
 # CC Switch
