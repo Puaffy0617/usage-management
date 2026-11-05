@@ -3,21 +3,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import {
   ChartColumn,
   Download,
   Link2,
   Loader2,
   Plus,
   RefreshCw,
+  Settings2,
   Upload,
 } from "lucide-react";
 import { AppPageHeader } from "@/components/shell/AppPageHeader";
@@ -38,17 +30,25 @@ import { settingsApi } from "@/lib/api/settings";
 import { deliverLoginLink } from "@/lib/authLoginLink";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { PageTabs } from "@/components/ui/page-tabs";
+import { Switch } from "@/components/ui/switch";
+import { HelpTip } from "@/components/ui/help-tip";
+import {
+  UnifiedUsageOverview,
+  type UnifiedOverviewMetric,
+} from "./UnifiedUsageOverview";
+import { formatTokensCompact } from "./format";
+import { useUnifiedUsagePricing } from "@/hooks/useUnifiedUsagePricing";
+import { estimateUnifiedUsageCosts } from "@/lib/unifiedUsageCost";
 import type {
   AnalyticsAccount,
   AnalyticsImportFormat,
   AnalyticsLogin,
-  MetricAggregate,
+  UsageBucket,
 } from "@/types/unifiedUsage";
 import {
-  buildAccountTrend,
   formatAnalyticsTimestamp,
-  metricGroupKey,
-  safeMetricSum,
+  formatApiEquivalentCny,
   utcRange,
 } from "./unifiedUsageData";
 
@@ -63,6 +63,11 @@ const COLORS = [
 ];
 const PANEL = "rounded-panel border border-border bg-surface p-4";
 const SELECT = cn(fieldClass, "h-8 w-auto min-w-[130px]");
+const PROVENANCE_RANK = new Map([
+  ["official", 0],
+  ["local", 1],
+  ["estimated", 2],
+]);
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -260,12 +265,36 @@ export function UnifiedUsageDashboard({
       ? value.toLocaleString(locale, { maximumFractionDigits: 2 })
       : tx("numericRange", "Outside supported numeric range");
   const queryClient = useQueryClient();
-  const [days, setDays] = useState("30");
+  const [days, setDays] = useState("all");
   const [accountId, setAccountId] = useState("");
   const [model, setModel] = useState("");
   const [platform, setPlatform] = useState("");
   const [feature, setFeature] = useState("");
-  const [chosenGroup, setChosenGroup] = useState("");
+  const [chosenFamily, setChosenFamily] = useState("");
+  const [overviewMetric, setOverviewMetric] =
+    useState<UnifiedOverviewMetric>("tokens");
+  const [tab, setTab] = useState<"accounts" | "models" | "details">("accounts");
+  const [manageOpen, setManageOpen] = useState(false);
+  const [detailPage, setDetailPage] = useState(0);
+  const [autoRefresh, setAutoRefresh] = useState(() => {
+    try {
+      return (
+        localStorage.getItem("cc-switch.unified-usage.autoRefresh") !== "0"
+      );
+    } catch {
+      return true;
+    }
+  });
+  const [autoRefreshMs, setAutoRefreshMs] = useState(() => {
+    try {
+      const value = Number(
+        localStorage.getItem("cc-switch.unified-usage.autoRefreshMs"),
+      );
+      return [60000, 120000, 300000].includes(value) ? value : 120000;
+    } catch {
+      return 120000;
+    }
+  });
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const lastAutoAttemptAt = useRef(new Map<string, number>());
@@ -317,27 +346,87 @@ export function UnifiedUsageDashboard({
   const selectedAccounts = accounts.filter(
     (account) => !accountId || account.id === accountId,
   );
-  const groups = useMemo(() => {
-    const result = new Map<string, MetricAggregate>();
-    for (const row of data?.totals ?? []) result.set(metricGroupKey(row), row);
-    return [...result.entries()].sort(
-      ([, a], [, b]) =>
-        ["official", "local", "estimated"].indexOf(a.provenance) -
-        ["official", "local", "estimated"].indexOf(b.provenance),
-    );
-  }, [data]);
-  const groupKey = groups.some(([key]) => key === chosenGroup)
-    ? chosenGroup
-    : (groups[0]?.[0] ?? "");
-  const group = groups.find(([key]) => key === groupKey)?.[1];
-  const totals = (data?.totals ?? []).filter(
-    (row) => metricGroupKey(row) === groupKey,
+  const pricing = useUnifiedUsagePricing();
+  const fxProviderUrl =
+    pricing.fx.providerUrl &&
+    [
+      "https://www.exchangerate-api.com/",
+      "https://www.floatrates.com/",
+    ].includes(pricing.fx.providerUrl)
+      ? pricing.fx.providerUrl
+      : null;
+  const allBuckets = data?.usageBuckets ?? [];
+  const catalog = useMemo(
+    () =>
+      estimateUnifiedUsageCosts(
+        baseQuery.data?.usageBuckets ?? [],
+        pricing.pricing,
+        { usdToCny: pricing.usdToCny },
+      ),
+    [baseQuery.data, pricing.pricing, pricing.usdToCny],
   );
-  const total = safeMetricSum(totals.map((row) => row.value));
-  const trend = useMemo(
-    () => buildAccountTrend(data?.daily ?? [], groupKey),
-    [data, groupKey],
+  const families = [...catalog.families].sort(
+    (a, b) =>
+      (PROVENANCE_RANK.get(a.provenance) ?? 3) -
+      (PROVENANCE_RANK.get(b.provenance) ?? 3),
   );
+  const familyKey = families.some((family) => family.key === chosenFamily)
+    ? chosenFamily
+    : families[0]?.key;
+  const report = useMemo(
+    () =>
+      estimateUnifiedUsageCosts(allBuckets, pricing.pricing, {
+        familyKey,
+        usdToCny: pricing.usdToCny,
+      }),
+    [data, familyKey, pricing.pricing, pricing.usdToCny],
+  );
+  const money = (value: number | null) => formatApiEquivalentCny(value, locale);
+  const count = (value: number | null) =>
+    value === null
+      ? "—"
+      : Number.isFinite(value) && value <= Number.MAX_SAFE_INTEGER
+        ? formatTokensCompact(value, locale)
+        : tx("numericRange", "Outside supported numeric range");
+  const percent = (value: number | null) =>
+    value === null
+      ? "—"
+      : new Intl.NumberFormat(locale, {
+          style: "percent",
+          maximumFractionDigits: 1,
+        }).format(value);
+  const dayValues = Object.fromEntries(
+    Object.entries(report.byDay).map(([day, value]) => [
+      day,
+      {
+        cost: value.cny,
+        requests: value.requests,
+        tokens: value.measuredTokens,
+        hitRate: value.cacheHitRate,
+      },
+    ]),
+  );
+  useEffect(
+    () => setDetailPage(0),
+    [days, accountId, model, platform, feature, familyKey],
+  );
+  const costUnavailableReason = report.total.reasons.includes("missing_model")
+    ? tx(
+        "costMissingModel",
+        "The source has not reported model details for pricing.",
+      )
+    : report.total.reasons.some((reason) =>
+          ["missing_token_breakdown", "ambiguous_input_tokens"].includes(
+            reason,
+          ),
+        )
+      ? tx(
+          "costMissingBreakdown",
+          "Billing-compatible input/output token details have not been reported.",
+        )
+      : report.total.reasons.includes("missing_price")
+        ? tx("costMissingPrice", "The model has no configured API price.")
+        : "";
   const originLabel = (origin: string) => {
     if (["official", "officially_reported"].includes(origin))
       return tx("official", "Officially reported");
@@ -346,7 +435,12 @@ export function UnifiedUsageDashboard({
     if (origin === "estimated") return tx("estimated", "Estimated");
     return origin;
   };
-  const metricLabel = (row: MetricAggregate) => {
+  const familyLabel = (row: {
+    source: string;
+    scope: string;
+    provenance: string;
+    granularity: string;
+  }) => {
     const source =
       row.source === "codex_app_server"
         ? tx("accountService", "Official account service")
@@ -361,7 +455,15 @@ export function UnifiedUsageDashboard({
         : row.scope === "chatgpt_export_activity"
           ? tx("exportCoverage", "Exported conversation metadata")
           : row.scope;
-    return `${row.metric.replace(/_/g, " ")} · ${row.unit} · ${originLabel(row.provenance)} · ${coverage} · ${source}`;
+    const granularity =
+      row.granularity === "day"
+        ? tx("familyDay", "Daily")
+        : row.granularity === "event"
+          ? tx("familyEvent", "Event aggregates")
+          : row.granularity === "lifetime"
+            ? tx("familyLifetime", "Lifetime")
+            : tx("notReported", "Not reported");
+    return `${source} · ${originLabel(row.provenance)} · ${coverage} · ${granularity}`;
   };
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: QUERY_KEY });
@@ -381,6 +483,11 @@ export function UnifiedUsageDashboard({
     }
   };
   const sync = async (id?: string) => {
+    const targets = id
+      ? accounts.filter((account) => account.id === id)
+      : accounts;
+    for (const target of targets)
+      lastAutoAttemptAt.current.set(target.id, Date.now());
     const result = await unifiedUsageApi.sync(id);
     if (result.errors.length) setError(result.errors.join("\n"));
   };
@@ -389,19 +496,24 @@ export function UnifiedUsageDashboard({
   // A timer is not a second collector and stops when the page is unmounted.
   useEffect(() => {
     const synchronizeDueAccounts = async () => {
-      if (busyRef.current || document.visibilityState === "hidden") return;
+      if (
+        !autoRefresh ||
+        busyRef.current ||
+        document.visibilityState === "hidden" ||
+        document.documentElement.dataset.windowActive === "false"
+      )
+        return;
       const now = Date.now();
       const due = accounts.filter(
         (account) =>
           ["connected", "error"].includes(account.connectionStatus) &&
           account.identity !== null &&
-          account.syncIntervalMinutes > 0 &&
           now -
             Math.max(
               account.lastSyncAt ?? 0,
               lastAutoAttemptAt.current.get(account.id) ?? 0,
             ) >=
-            account.syncIntervalMinutes * 60_000,
+            autoRefreshMs,
       );
       if (!due.length) return;
       await run(async () => {
@@ -419,14 +531,19 @@ export function UnifiedUsageDashboard({
         }
       });
     };
-    const timer = window.setInterval(
-      () => void synchronizeDueAccounts(),
-      60_000,
-    );
-    return () => window.clearInterval(timer);
+    void synchronizeDueAccounts();
+    const resume = () => void synchronizeDueAccounts();
+    window.addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", resume);
+    const timer = window.setInterval(resume, 60_000);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", resume);
+      document.removeEventListener("visibilitychange", resume);
+    };
     // Account metadata is refreshed after each synchronization, including failures.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts]);
+  }, [accounts, autoRefresh, autoRefreshMs]);
 
   useEffect(
     () => () => {
@@ -547,632 +664,846 @@ export function UnifiedUsageDashboard({
           .map((row) => row.label),
       ),
     ].sort();
-  const breakdown = (dimension: "model" | "platform" | "feature") => {
-    const result = new Map<string, number>();
-    for (const row of data?.breakdowns ?? []) {
-      if (row.dimension !== dimension || metricGroupKey(row) !== groupKey)
-        continue;
-      result.set(row.label, (result.get(row.label) ?? 0) + row.value);
-    }
-    const rows = [...result.entries()].sort(([, a], [, b]) => b - a);
-    return rows.every(([label]) =>
-      ["", "unknown", "Unavailable", "unavailable"].includes(label),
-    )
-      ? []
-      : rows;
+  const managementTable = (
+    <section className={PANEL}>
+      <h2 className="mb-3 text-body font-semibold text-fg-1">
+        {tx("comparison", "Account comparison")}
+      </h2>
+      <div className="overflow-x-auto">
+        <table className="w-full text-start text-body">
+          <thead className="border-b border-border text-caption text-fg-3">
+            <tr>
+              {[
+                tx("account", "Account"),
+                tx("retainedAccountSummary", "Retained account summary"),
+                tx("quota", "Quota snapshot"),
+                tx("connection", "Connection & synchronization"),
+                tx("manage", "Manage"),
+              ].map((label) => (
+                <th key={label} className="px-2 py-2 text-start font-medium">
+                  {label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {accounts.map((account, index) => {
+              return (
+                <tr
+                  key={account.id}
+                  className="border-b border-border last:border-0"
+                >
+                  <td className="max-w-[220px] px-2 py-4 align-top">
+                    <div className="flex items-center gap-2 font-medium text-fg-1">
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{
+                          backgroundColor: COLORS[index % COLORS.length],
+                        }}
+                      />
+                      {account.name}
+                    </div>
+                    <p className="mt-1 break-all text-caption text-fg-2">
+                      {account.identity ?? tx("notIdentified", "Not connected")}
+                    </p>
+                    <p className="mt-1 text-caption text-fg-3">
+                      {account.subscription ??
+                        tx("planUnavailable", "Subscription not reported")}
+                    </p>
+                    {account.linkedAccountId && (
+                      <p className="mt-1 text-caption text-fg-2">
+                        {tx(
+                          "existingAccountSource",
+                          "Existing CC Switch account",
+                        )}
+                      </p>
+                    )}
+                  </td>
+                  <td className="px-2 py-4 align-top">
+                    <AccountSummary account={account} number={number} />
+                  </td>
+                  <td className="min-w-[170px] px-2 py-4 align-top">
+                    <Quota account={account} locale={locale} />
+                  </td>
+                  <td className="max-w-[230px] px-2 py-4 align-top">
+                    <span className="rounded-full bg-subtle px-2 py-0.5 text-caption text-fg-2">
+                      {tx(
+                        `status_${account.connectionStatus}`,
+                        account.connectionStatus.replace(/_/g, " "),
+                      )}
+                    </span>
+                    <p className="mt-2 text-caption text-fg-3">
+                      {tx("lastSync", "Last sync")}:{" "}
+                      {formatAnalyticsTimestamp(account.lastSyncAt, locale) ??
+                        tx("never", "Never")}
+                    </p>
+                    {account.lastError && (
+                      <p className="mt-2 break-words text-caption text-warning-text">
+                        {account.lastError}
+                      </p>
+                    )}
+                    {account.linkedAccountId &&
+                      account.connectionStatus === "reauth_required" && (
+                        <p className="mt-2 text-caption text-fg-2">
+                          {tx(
+                            "manageExistingSignIn",
+                            "Manage this sign-in in CC Switch's Accounts page, then refresh analytics.",
+                          )}
+                        </p>
+                      )}
+                    {account.linkedAccountId &&
+                      account.connectionStatus === "disconnected" && (
+                        <p className="mt-2 text-caption text-fg-2">
+                          {tx(
+                            "resumeExistingAnalytics",
+                            "Import existing ChatGPT accounts again to resume analytics for this account.",
+                          )}
+                        </p>
+                      )}
+                  </td>
+                  <td className="px-2 py-4 align-top">
+                    <div className="flex flex-wrap gap-1">
+                      <Button
+                        variant="quiet"
+                        size="compact"
+                        disabled={busy}
+                        onClick={() => editAccount(account)}
+                      >
+                        {tx("edit", "Edit")}
+                      </Button>
+                      {!account.linkedAccountId && (
+                        <Button
+                          variant="neutral"
+                          size="compact"
+                          disabled={busy}
+                          onClick={() => void connect(account)}
+                        >
+                          {account.connectionStatus === "connected"
+                            ? tx("reconnect", "Reconnect")
+                            : tx("connect", "Connect")}
+                        </Button>
+                      )}
+                      <Button
+                        variant="quiet"
+                        size="compact"
+                        disabled={busy}
+                        onClick={() => void run(() => sync(account.id))}
+                      >
+                        {tx("sync", "Sync now")}
+                      </Button>
+                      {((account.linkedAccountId &&
+                        account.connectionStatus !== "disconnected") ||
+                        account.connectionStatus === "connected") && (
+                        <Button
+                          variant="quiet"
+                          size="compact"
+                          disabled={busy}
+                          onClick={() =>
+                            void run(() =>
+                              unifiedUsageApi.disconnectAccount(account.id),
+                            )
+                          }
+                        >
+                          {account.linkedAccountId
+                            ? tx("unlinkAnalytics", "Unlink analytics")
+                            : tx("disconnect", "Disconnect")}
+                        </Button>
+                      )}
+                      <Button
+                        variant="quiet"
+                        size="compact"
+                        disabled={busy}
+                        onClick={() => setRemoving(account)}
+                      >
+                        {tx("delete", "Delete")}
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+  const refreshableAccounts = accounts.filter(
+    (account) =>
+      ["connected", "error"].includes(account.connectionStatus) &&
+      account.identity !== null,
+  );
+  const lastSyncAt =
+    refreshableAccounts.length &&
+    refreshableAccounts.every((account) => account.lastSyncAt !== null)
+      ? Math.min(...refreshableAccounts.map((account) => account.lastSyncAt!))
+      : 0;
+  const prepareImport = () => {
+    if (!accounts.length) setImportFormat("backup");
+    setImportAccount(accountId || accounts[0]?.id || "");
+    setImportOpen(true);
   };
-
+  const detailRows = report.buckets.slice(
+    detailPage * 30,
+    (detailPage + 1) * 30,
+  );
+  const metricOf = (bucket: UsageBucket, names: string[], unit = "tokens") =>
+    bucket.metrics.find(
+      (metric) => names.includes(metric.metric) && metric.unit === unit,
+    )?.value ?? null;
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <AppPageHeader
         icon={<ChartColumn className="h-5 w-5" strokeWidth={1.5} />}
-        title={tx("accountAnalytics", "Account analytics")}
+        title={t("nav.usage", { defaultValue: "Usage statistics" })}
+        titleExtra={
+          <HelpTip
+            title={tx(
+              "partialTitle",
+              "A measured, partial picture of your accounts",
+            )}
+          >
+            {tx(
+              "partialDescription",
+              "Official account-service activity can include usage across devices, but does not establish complete ChatGPT Chat, voice, image, upload, or tool usage. Missing data means unavailable, not zero. Device activity remains in its own view.",
+            )}
+          </HelpTip>
+        }
         actions={
-          <>
+          <div className="flex h-8 items-stretch overflow-hidden rounded-control border border-border-strong bg-surface">
             <Button
               variant="quiet"
-              size="compact"
-              onClick={() => void exportRecords()}
-              disabled={busy}
-            >
-              <Download className="h-3.5 w-3.5" />
-              {tx("export", "Export")}
-            </Button>
-            <Button
-              variant="neutral"
-              size="compact"
-              disabled={busy}
-              onClick={() => {
-                if (!accounts.length) setImportFormat("backup");
-                setImportAccount(accountId || accounts[0]?.id || "");
-                setImportOpen(true);
-              }}
-            >
-              <Upload className="h-3.5 w-3.5" />
-              {tx("import", "Import")}
-            </Button>
-            <Button
-              variant="neutral"
-              size="compact"
-              disabled={busy || accounts.length === 0}
+              className="rounded-none"
+              disabled={busy || !accounts.length}
+              aria-label={tx("sync", "Sync now")}
               onClick={() => void run(() => sync())}
             >
-              {busy ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
-              )}
-              {tx("sync", "Sync now")}
+              <RefreshCw
+                className={cn("h-3.5 w-3.5", busy && "animate-spin")}
+              />
+              {busy
+                ? tx("syncing", "Synchronizing…")
+                : lastSyncAt && Date.now() - lastSyncAt < 60000
+                  ? tx("justSynced", "Just synchronized")
+                  : tx("sync", "Sync now")}
             </Button>
             <Button
-              variant="solid"
-              size="compact"
-              disabled={busy}
-              onClick={() => editAccount("new")}
+              variant="quiet"
+              size="icon"
+              className="rounded-none border-s border-border"
+              aria-label={tx("manageAccounts", "Manage accounts")}
+              onClick={() => setManageOpen(true)}
             >
-              <Plus className="h-3.5 w-3.5" />
-              {tx("addAccount", "Add account")}
+              <Settings2 className="h-3.5 w-3.5" />
             </Button>
-          </>
+          </div>
         }
       />
       {navigation}
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-6">
-        <div className="flex flex-wrap items-center gap-3">
-          <Button
-            variant="neutral"
-            size="compact"
-            disabled={busy}
-            onClick={() => void importExistingAccounts()}
-          >
-            <Link2 className="h-3.5 w-3.5" />
-            {tx("importExistingAccounts", "Import existing ChatGPT accounts")}
-          </Button>
-          <p className="min-w-[240px] flex-1 text-caption text-fg-2">
-            {tx(
-              "existingSessionsNotice",
-              "Existing accounts stay signed in; analytics links reuse CC Switch-managed sessions. Sync may refresh an existing session normally.",
-            )}
-          </p>
-        </div>
-        <Notice
-          title={tx(
-            "partialTitle",
-            "A measured, partial picture of your accounts",
-          )}
+      <div className="flex flex-wrap items-center gap-2 px-6 py-2.5">
+        <select
+          aria-label={tx("range", "Date range")}
+          className={SELECT}
+          value={days}
+          onChange={(event) => setDays(event.target.value)}
         >
-          {tx(
-            "partialDescription",
-            "Official account-service activity can include usage across devices, but does not establish complete ChatGPT Chat, voice, image, upload, or tool usage. Missing data means unavailable, not zero. Device activity remains in its own view.",
-          )}{" "}
-          <button
-            type="button"
-            className="underline"
-            onClick={() =>
-              void settingsApi.openExternal(
-                "https://learn.chatgpt.com/docs/app-server",
-              )
-            }
-          >
-            {tx("sourceDocumentation", "Official source documentation")}
-          </button>
-        </Notice>
-        <div role="status">
-          {importNotice && <Notice title={importNotice} />}
-          {(error || queryError) && (
-            <Notice
-              tone="warning"
-              title={tx("operationFailed", "Some data could not be updated")}
-              actions={
-                <Button
-                  variant="quiet"
-                  size="compact"
-                  onClick={() => void invalidate()}
-                >
-                  {tx("retry", "Retry")}
-                </Button>
-              }
-            >
-              <span className="whitespace-pre-wrap">
-                {error || String(queryError)}
-              </span>
-            </Notice>
-          )}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            aria-label={tx("range", "Date range")}
-            className={SELECT}
-            value={days}
-            onChange={(event) => setDays(event.target.value)}
-          >
-            <option value="1">{tx("today", "Today")}</option>
-            <option value="7">{tx("week", "7 days")}</option>
-            <option value="30">{tx("month", "30 days")}</option>
-            <option value="all">{tx("allHistory", "All history")}</option>
-          </select>
-          <select
-            aria-label={tx("account", "Account")}
-            className={SELECT}
-            value={accountId}
-            onChange={(event) => setAccountId(event.target.value)}
-          >
-            <option value="">{tx("allAccounts", "All accounts")}</option>
-            {accounts.map((account) => (
-              <option key={account.id} value={account.id}>
-                {account.name}
+          <option value="all">{tx("allHistory", "All history")}</option>
+          <option value="1">{tx("today", "Today")}</option>
+          <option value="7">{tx("week", "7 days")}</option>
+          <option value="30">{tx("month", "30 days")}</option>
+        </select>
+        <span className="mx-1 h-4 w-px bg-border" />
+        <select
+          aria-label={tx("account", "Account")}
+          className={SELECT}
+          value={accountId}
+          onChange={(event) => setAccountId(event.target.value)}
+        >
+          <option value="">{tx("allAccounts", "All accounts")}</option>
+          {accounts.map((account) => (
+            <option key={account.id} value={account.id}>
+              {account.name}
+            </option>
+          ))}
+        </select>
+        <select
+          aria-label={tx("model", "Model")}
+          className={SELECT}
+          value={model}
+          onChange={(event) => setModel(event.target.value)}
+        >
+          <option value="">{tx("all_model", "All models")}</option>
+          {[
+            ...new Set(
+              (baseQuery.data?.usageBuckets ?? [])
+                .map((bucket) => bucket.model)
+                .filter((value): value is string => value !== null),
+            ),
+          ]
+            .sort()
+            .map((value) => (
+              <option key={value} value={value}>
+                {value}
               </option>
             ))}
-          </select>
-          {(["model", "platform", "feature"] as const).map((dimension) => {
-            const value =
-              dimension === "model"
-                ? model
-                : dimension === "platform"
-                  ? platform
-                  : feature;
-            const change =
-              dimension === "model"
-                ? setModel
-                : dimension === "platform"
-                  ? setPlatform
-                  : setFeature;
-            return (
-              <select
-                key={dimension}
-                aria-label={tx(dimension, dimension)}
-                className={SELECT}
-                value={value}
-                onChange={(event) => change(event.target.value)}
+        </select>
+        <select
+          aria-label={tx("sourceFamily", "Data source and coverage")}
+          className={cn(SELECT, "max-w-[390px]")}
+          value={familyKey ?? ""}
+          onChange={(event) => setChosenFamily(event.target.value)}
+        >
+          {!families.length && (
+            <option value="">
+              {tx("noSourceData", "No source data reported")}
+            </option>
+          )}
+          {families.map((family) => (
+            <option key={family.key} value={family.key}>
+              {familyLabel(family)}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 pb-6 pt-1">
+        {(error || queryError || importNotice) && (
+          <div role="status" className="space-y-2">
+            {importNotice && <Notice title={importNotice} />}
+            {(error || queryError) && (
+              <Notice
+                tone="warning"
+                title={tx("operationFailed", "Some data could not be updated")}
+                actions={
+                  <Button
+                    variant="quiet"
+                    size="compact"
+                    onClick={() => void invalidate()}
+                  >
+                    {tx("retry", "Retry")}
+                  </Button>
+                }
               >
-                <option value="">
-                  {tx(`all_${dimension}`, `All ${dimension}s`)}
-                </option>
-                {dimensionOptions(dimension).map((label) => (
-                  <option key={label} value={label}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            );
-          })}
-          <span className="text-caption text-fg-3">
-            {tx("utcDates", "Dates are UTC")}
-          </span>
-        </div>
-        {accountsQuery.isLoading || activeQuery.isLoading ? (
-          <p className="flex items-center gap-2 text-body text-fg-2">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {tx("loading", "Loading account history…")}
-          </p>
-        ) : accounts.length === 0 ? (
-          <section className={`${PANEL} py-12 text-center`}>
-            <h2 className="text-title text-fg-1">
-              {tx("emptyTitle", "Bring your accounts into one view")}
-            </h2>
-            <p className="mx-auto mt-2 max-w-lg text-body text-fg-2">
-              {tx(
-                "emptyDescription",
-                "Add two or more accounts, connect each through the official Codex sign-in, or import your own usage records. Statistics appear only when real data is available.",
-              )}
-            </p>
-            <Button
-              className="mt-5"
-              variant="neutral"
-              onClick={() => editAccount("new")}
-            >
-              {tx("addAccount", "Add account")}
-            </Button>
-          </section>
-        ) : (
-          <>
-            {groups.length > 0 && (
-              <label className="flex flex-col gap-1.5 text-caption text-fg-2">
-                {tx("metricDefinition", "Metric and coverage")}
-                <select
-                  aria-label={tx("metricDefinition", "Metric and coverage")}
-                  className={`${SELECT} max-w-full`}
-                  value={groupKey}
-                  onChange={(event) => setChosenGroup(event.target.value)}
-                >
-                  {groups.map(([key, row]) => (
-                    <option key={key} value={key}>
-                      {metricLabel(row)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                <span className="whitespace-pre-wrap">
+                  {error || String(queryError)}
+                </span>
+              </Notice>
             )}
-            <section className="grid gap-3 sm:grid-cols-3">
-              <div className={PANEL}>
-                <p className="text-caption text-fg-2">
-                  {tx("combined", "Combined reported activity")}
-                </p>
-                <p className="mt-2 text-3xl font-semibold tabular-nums text-fg-1">
-                  {group
-                    ? total === null
-                      ? tx("numericRange", "Outside supported numeric range")
-                      : number(total)
-                    : "—"}{" "}
-                  <span className="text-body font-normal text-fg-2">
-                    {group?.unit}
-                  </span>
-                </p>
-                <p className="mt-2 text-caption text-fg-3">
-                  {group
-                    ? `${group.metric} · ${originLabel(group.provenance)}`
-                    : tx("noMetrics", "No measurable usage returned")}
-                </p>
-              </div>
-              <div className={PANEL}>
-                <p className="text-caption text-fg-2">
-                  {tx("accountsReporting", "Accounts reporting this metric")}
-                </p>
-                <p className="mt-2 text-3xl font-semibold tabular-nums text-fg-1">
-                  {new Set(totals.map((row) => row.accountId)).size}{" "}
-                  <span className="text-body font-normal text-fg-2">
-                    / {selectedAccounts.length}
-                  </span>
-                </p>
-                <p className="mt-2 text-caption text-fg-3">
-                  {tx(
-                    "partialTotal",
-                    "Combined totals include returned observations only.",
-                  )}
-                </p>
-              </div>
-              <div className={PANEL}>
-                <p className="text-caption text-fg-2">
-                  {tx("retainedRecords", "Records in this selection")}
-                </p>
-                <p className="mt-2 text-3xl font-semibold tabular-nums text-fg-1">
-                  {data ? number(data.recordCount) : "—"}
-                </p>
-                <p className="mt-2 text-caption text-fg-3">
-                  {tx(
-                    "separateMetrics",
-                    "Different units, sources, and coverage stay separate.",
-                  )}
-                </p>
-              </div>
-            </section>
-            <section className={PANEL}>
+          </div>
+        )}
+        {!accountsQuery.isLoading && !accounts.length && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-panel border border-border bg-surface px-4 py-3">
+            <div>
               <h2 className="text-body font-semibold text-fg-1">
-                {tx("trend", "Daily activity by account")}
+                {tx("emptyTitle", "Bring your accounts into one view")}
               </h2>
               <p className="mt-1 text-caption text-fg-3">
                 {tx(
-                  "missingDays",
-                  "Gaps are days without reported observations. Lifetime summaries are shown separately.",
+                  "existingSessionsNotice",
+                  "Existing accounts stay signed in; analytics links reuse CC Switch-managed sessions. Sync may refresh an existing session normally.",
                 )}
               </p>
-              {trend.length > 0 ? (
-                <div
-                  className="mt-4 h-64"
-                  aria-label={tx("trend", "Daily activity by account")}
-                >
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart
-                      data={trend}
-                      margin={{ top: 8, right: 12, bottom: 4, left: 4 }}
-                    >
-                      <CartesianGrid
-                        stroke="var(--chart-grid)"
-                        strokeDasharray="3 3"
-                        vertical={false}
-                      />
-                      <XAxis dataKey="date" fontSize={11} tickLine={false} />
-                      <YAxis
-                        fontSize={11}
-                        tickLine={false}
-                        width={64}
-                        tickFormatter={(value: number) => number(value)}
-                      />
-                      <Tooltip
-                        formatter={(value) =>
-                          typeof value === "number" ? number(value) : value
-                        }
-                        contentStyle={{
-                          background: "var(--bg-card)",
-                          borderColor: "hsl(var(--border))",
-                          borderRadius: 8,
-                        }}
-                      />
-                      {selectedAccounts.map((account, index) => (
-                        <Line
-                          key={account.id}
-                          dataKey={account.id}
-                          name={account.name}
-                          stroke={COLORS[index % COLORS.length]}
-                          strokeWidth={2}
-                          dot={{ r: 3 }}
-                          connectNulls={false}
-                          isAnimationActive={false}
-                        />
-                      ))}
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="neutral"
+                size="compact"
+                onClick={() => void importExistingAccounts()}
+              >
+                {tx(
+                  "importExistingAccounts",
+                  "Import existing ChatGPT accounts",
+                )}
+              </Button>
+              <Button
+                variant="neutral"
+                size="compact"
+                onClick={() => editAccount("new")}
+              >
+                {tx("addAccount", "Add account")}
+              </Button>
+            </div>
+          </div>
+        )}
+        <UnifiedUsageOverview
+          total={{
+            cost: report.total.cny,
+            requests: report.total.requests,
+            tokens: report.total.measuredTokens,
+            hitRate: report.total.cacheHitRate,
+          }}
+          daily={dayValues}
+          partial={{
+            cost: report.total.partial,
+            requests: report.total.requestsPartial,
+            tokens: report.total.measuredTokensPartial,
+            hitRate: report.total.cacheHitRatePartial,
+          }}
+          metric={overviewMetric}
+          onMetricChange={setOverviewMetric}
+          note={`${tx("costExplanation", "Token × model API price × exchange rate. This is an estimated API equivalent, not a ChatGPT subscription charge.")} ${costUnavailableReason} ${report.total.partial && report.total.pricedBuckets > 0 ? tx("partialCost", "Only part of the selected records can be priced.") : ""} ${pricing.fx.status === "unavailable" || pricing.fx.status === "loading" ? tx("fxUnavailable", "CNY conversion is unavailable until a real exchange rate is returned.") : pricing.fx.status === "stale" ? tx("fxStale", "Using the previous reported exchange rate; refresh is temporarily unavailable.") : ""} ${tx("reportedOnly", "Totals include only returned observations; * marks partial coverage.")}`}
+          attribution={
+            <p className="mt-1 flex flex-wrap items-center gap-x-1 text-caption text-fg-3">
+              {pricing.usdToCny === null ? (
+                tx(
+                  "fxUnavailable",
+                  "CNY conversion is unavailable until a real exchange rate is returned.",
+                )
               ) : (
-                <p className="py-10 text-center text-body text-fg-3">
-                  {tx(
-                    "noDaily",
-                    "Daily history has not been reported for this metric.",
+                <>
+                  <span>
+                    1 USD ={" "}
+                    {new Intl.NumberFormat(locale, {
+                      maximumFractionDigits: 6,
+                    }).format(pricing.usdToCny)}{" "}
+                    CNY · {tx("fxSource", "FX source")}
+                  </span>
+                  {fxProviderUrl ? (
+                    <button
+                      type="button"
+                      className="underline underline-offset-2 hover:text-fg-1"
+                      onClick={() =>
+                        void settingsApi.openExternal(fxProviderUrl)
+                      }
+                    >
+                      {pricing.fx.providerName ?? pricing.fx.source}
+                    </button>
+                  ) : (
+                    <span>
+                      {pricing.fx.providerName ?? pricing.fx.source ?? "—"}
+                    </span>
                   )}
-                </p>
+                  <span>
+                    · {tx("fxFetchedAt", "Fetched at")}:{" "}
+                    {formatAnalyticsTimestamp(pricing.fx.updatedAt, locale) ??
+                      "—"}
+                  </span>
+                  {pricing.fx.status === "stale" && (
+                    <span className="ms-1 rounded bg-warning-soft px-1.5 py-0.5 text-badge text-warning-text">
+                      {tx("fxStaleBadge", "Previous rate")}
+                    </span>
+                  )}
+                </>
               )}
-            </section>
-            <section className={PANEL}>
-              <h2 className="mb-3 text-body font-semibold text-fg-1">
-                {tx("comparison", "Account comparison")}
-              </h2>
-              <div className="overflow-x-auto">
-                <table className="w-full text-start text-body">
-                  <thead className="border-b border-border text-caption text-fg-3">
-                    <tr>
-                      {[
+            </p>
+          }
+        />
+        {report.total.measuredTokens === null &&
+          report.total.requests === null && (
+            <p className="-mt-3 text-caption text-fg-3">
+              {tx("noMetrics", "No measurable usage returned")}
+            </p>
+          )}
+        <section className="shrink-0 overflow-hidden rounded-panel border border-border bg-surface">
+          <PageTabs
+            aria-label={tx("detailViews", "Analytics detail views")}
+            className="h-11 px-4"
+            items={[
+              {
+                value: "accounts" as const,
+                label: tx("accountsTab", "Accounts"),
+              },
+              { value: "models" as const, label: tx("modelsTab", "Models") },
+              {
+                value: "details" as const,
+                label: (
+                  <span>
+                    {tx("dailyRecords", "Daily records")}{" "}
+                    <span className="ms-1 rounded bg-subtle px-1.5 text-caption text-fg-3">
+                      {report.buckets.length}
+                    </span>
+                  </span>
+                ),
+              },
+            ]}
+            value={tab}
+            onValueChange={setTab}
+          />
+          <div className="overflow-x-auto">
+            <table className="w-full whitespace-nowrap text-body">
+              <thead className="border-b border-border bg-subtle/40 text-caption text-fg-3">
+                <tr>
+                  {(tab === "accounts"
+                    ? [
                         tx("account", "Account"),
-                        tx("selectedMetric", "Selected metric"),
-                        tx("quota", "Quota snapshot"),
-                        tx("connection", "Connection & synchronization"),
-                        tx("manage", "Manage"),
-                      ].map((label) => (
-                        <th
-                          key={label}
-                          className="px-2 py-2 text-start font-medium"
-                        >
-                          {label}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selectedAccounts.map((account, index) => {
-                      const rows = totals.filter(
-                        (row) => row.accountId === account.id,
-                      );
-                      return (
-                        <tr
-                          key={account.id}
-                          className="border-b border-border last:border-0"
-                        >
-                          <td className="max-w-[220px] px-2 py-4 align-top">
-                            <div className="flex items-center gap-2 font-medium text-fg-1">
-                              <span
-                                className="h-2 w-2 shrink-0 rounded-full"
-                                style={{
-                                  backgroundColor:
-                                    COLORS[index % COLORS.length],
-                                }}
-                              />
-                              {account.name}
-                            </div>
-                            <p className="mt-1 break-all text-caption text-fg-2">
-                              {account.identity ??
-                                tx("notIdentified", "Not connected")}
-                            </p>
-                            <p className="mt-1 text-caption text-fg-3">
-                              {account.subscription ??
-                                tx(
-                                  "planUnavailable",
-                                  "Subscription not reported",
-                                )}
-                            </p>
-                            {account.linkedAccountId && (
-                              <p className="mt-1 text-caption text-fg-2">
-                                {tx(
+                        tx("subscription", "Subscription"),
+                        tx("totalRequests", "Requests"),
+                        tx("measuredTokens", "Measured tokens"),
+                        tx("cacheHitRate", "Cache hit rate"),
+                        tx("apiEquivalent", "Estimated API equivalent"),
+                        tx("lastSync", "Last sync"),
+                      ]
+                    : tab === "models"
+                      ? [
+                          tx("model", "Model"),
+                          tx("totalRequests", "Requests"),
+                          tx("measuredTokens", "Measured tokens"),
+                          tx("cacheHitRate", "Cache hit rate"),
+                          tx("apiEquivalent", "Estimated API equivalent"),
+                        ]
+                      : [
+                          tx("utcDay", "UTC day"),
+                          tx("account", "Account"),
+                          tx("model", "Model"),
+                          tx("recordType", "Record type"),
+                          tx("totalRequests", "Requests"),
+                          tx("measuredTokens", "Measured tokens"),
+                          tx("cacheReadTokens", "Cache read tokens"),
+                          tx("apiEquivalent", "Estimated API equivalent"),
+                        ]
+                  ).map((label) => (
+                    <th key={label} className="h-9 px-4 text-start font-medium">
+                      {label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {tab === "accounts" &&
+                  selectedAccounts.map((account) => {
+                    const value = report.byAccount[account.id];
+                    const lifetime =
+                      typeof account.summary?.lifetimeTokens === "number" &&
+                      Number.isSafeInteger(account.summary.lifetimeTokens) &&
+                      account.summary.lifetimeTokens >= 0
+                        ? account.summary.lifetimeTokens
+                        : null;
+                    return (
+                      <tr key={account.id} className="hover:bg-subtle/40">
+                        <td className="px-4 py-3">
+                          <button
+                            className="flex items-center gap-2 text-start font-medium text-fg-1 hover:underline"
+                            onClick={() => setManageOpen(true)}
+                          >
+                            <span className="flex h-5 w-5 items-center justify-center rounded bg-subtle text-caption">
+                              {account.name.slice(0, 1)}
+                            </span>
+                            {account.name}
+                          </button>
+                          <p className="mt-0.5 text-caption text-fg-3">
+                            {account.linkedAccountId
+                              ? tx(
                                   "existingAccountSource",
                                   "Existing CC Switch account",
-                                )}
-                              </p>
-                            )}
-                          </td>
-                          <td className="px-2 py-4 align-top tabular-nums text-fg-1">
-                            {rows.length
-                              ? `${number(rows.reduce((sum, row) => sum + row.value, 0))} ${group?.unit}`
-                              : "—"}
-                            <AccountSummary account={account} number={number} />
-                          </td>
-                          <td className="min-w-[170px] px-2 py-4 align-top">
-                            <Quota account={account} locale={locale} />
-                          </td>
-                          <td className="max-w-[230px] px-2 py-4 align-top">
-                            <span className="rounded-full bg-subtle px-2 py-0.5 text-caption text-fg-2">
-                              {tx(
-                                `status_${account.connectionStatus}`,
-                                account.connectionStatus.replace(/_/g, " "),
-                              )}
-                            </span>
-                            <p className="mt-2 text-caption text-fg-3">
-                              {tx("lastSync", "Last sync")}:{" "}
-                              {formatAnalyticsTimestamp(
-                                account.lastSyncAt,
-                                locale,
-                              ) ?? tx("never", "Never")}
+                                )
+                              : (account.identity ??
+                                tx("notIdentified", "Not connected"))}
+                          </p>
+                          {lifetime !== null && (
+                            <p
+                              className="mt-0.5 text-caption tabular-nums text-fg-3"
+                              title={`${number(lifetime)} Tokens · ${tx("lifetimeExcluded", "Excluded from the current date/model estimate; this is not a complete ChatGPT bill.")}`}
+                            >
+                              {tx("lifetimeSnapshot", "Lifetime snapshot")}:{" "}
+                              {count(lifetime)} Tokens
                             </p>
-                            {account.lastError && (
-                              <p className="mt-2 break-words text-caption text-warning-text">
-                                {account.lastError}
-                              </p>
-                            )}
-                            {account.linkedAccountId &&
-                              account.connectionStatus ===
-                                "reauth_required" && (
-                                <p className="mt-2 text-caption text-fg-2">
-                                  {tx(
-                                    "manageExistingSignIn",
-                                    "Manage this sign-in in CC Switch's Accounts page, then refresh analytics.",
-                                  )}
-                                </p>
-                              )}
-                            {account.linkedAccountId &&
-                              account.connectionStatus === "disconnected" && (
-                                <p className="mt-2 text-caption text-fg-2">
-                                  {tx(
-                                    "resumeExistingAnalytics",
-                                    "Import existing ChatGPT accounts again to resume analytics for this account.",
-                                  )}
-                                </p>
-                              )}
-                          </td>
-                          <td className="px-2 py-4 align-top">
-                            <div className="flex flex-wrap gap-1">
-                              <Button
-                                variant="quiet"
-                                size="compact"
-                                disabled={busy}
-                                onClick={() => editAccount(account)}
-                              >
-                                {tx("edit", "Edit")}
-                              </Button>
-                              {!account.linkedAccountId && (
-                                <Button
-                                  variant="neutral"
-                                  size="compact"
-                                  disabled={busy}
-                                  onClick={() => void connect(account)}
-                                >
-                                  {account.connectionStatus === "connected"
-                                    ? tx("reconnect", "Reconnect")
-                                    : tx("connect", "Connect")}
-                                </Button>
-                              )}
-                              <Button
-                                variant="quiet"
-                                size="compact"
-                                disabled={busy}
-                                onClick={() => void run(() => sync(account.id))}
-                              >
-                                {tx("sync", "Sync now")}
-                              </Button>
-                              {((account.linkedAccountId &&
-                                account.connectionStatus !== "disconnected") ||
-                                account.connectionStatus === "connected") && (
-                                <Button
-                                  variant="quiet"
-                                  size="compact"
-                                  disabled={busy}
-                                  onClick={() =>
-                                    void run(() =>
-                                      unifiedUsageApi.disconnectAccount(
-                                        account.id,
-                                      ),
-                                    )
-                                  }
-                                >
-                                  {account.linkedAccountId
-                                    ? tx("unlinkAnalytics", "Unlink analytics")
-                                    : tx("disconnect", "Disconnect")}
-                                </Button>
-                              )}
-                              <Button
-                                variant="quiet"
-                                size="compact"
-                                disabled={busy}
-                                onClick={() => setRemoving(account)}
-                              >
-                                {tx("delete", "Delete")}
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-            <div className="grid gap-3 lg:grid-cols-3">
-              {(["model", "platform", "feature"] as const).map((dimension) => {
-                const rows = breakdown(dimension);
-                const maximum = rows.reduce(
-                  (max, [, value]) => Math.max(max, value),
-                  1,
-                );
-                return (
-                  <section key={dimension} className={PANEL}>
-                    <h2 className="text-body font-semibold capitalize text-fg-1">
-                      {tx(`by_${dimension}`, `By ${dimension}`)}
-                    </h2>
-                    {rows.length ? (
-                      <ul className="mt-4 space-y-3">
-                        {rows.map(([label, value]) => (
-                          <li key={label} className="text-caption">
-                            <div className="flex justify-between gap-2 text-fg-2">
-                              <span className="break-all">
-                                {[
-                                  "",
-                                  "unknown",
-                                  "Unavailable",
-                                  "unavailable",
-                                ].includes(label)
-                                  ? tx("notReported", "Not reported")
-                                  : label}
-                              </span>
-                              <span className="shrink-0 tabular-nums">
-                                {number(value)} {group?.unit}
-                              </span>
-                            </div>
-                            <div className="mt-1 h-1 rounded-full bg-subtle">
-                              <div
-                                className="h-full rounded-full bg-action"
-                                style={{ width: `${(value / maximum) * 100}%` }}
-                              />
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="mt-4 text-caption text-fg-3">
-                        {tx(
-                          "noBreakdown",
-                          "This source has not reported this breakdown.",
-                        )}
-                      </p>
-                    )}
-                  </section>
-                );
-              })}
-            </div>
-            <section className={PANEL}>
-              <h2 className="text-body font-semibold text-fg-1">
-                {tx("syncHistory", "Recent synchronization")}
-              </h2>
-              {data?.syncHistory.length ? (
-                <ul className="mt-3 divide-y divide-border">
-                  {data.syncHistory.slice(0, 20).map((item) => (
-                    <li
-                      key={item.id}
-                      className="flex flex-wrap justify-between gap-2 py-2 text-caption text-fg-2"
-                    >
-                      <span>
-                        {accounts.find(
-                          (account) => account.id === item.accountId,
-                        )?.name ?? item.accountId}{" "}
-                        · {item.source} · {item.status}
-                      </span>
-                      <span>
-                        {formatAnalyticsTimestamp(item.startedAt, locale)} ·{" "}
-                        {number(item.imported)} {tx("records", "records")}
-                      </span>
-                      {item.error && (
-                        <span className="w-full text-warning-text">
-                          {item.error}
-                        </span>
-                      )}
-                    </li>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-fg-2">
+                          {account.subscription ?? "—"}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-fg-2">
+                          {count(value?.requests ?? null)}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-fg-1">
+                          {count(value?.measuredTokens ?? null)}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-fg-2">
+                          {percent(value?.cacheHitRate ?? null)}
+                        </td>
+                        <td className="px-4 py-3 font-medium tabular-nums text-fg-1">
+                          {money(value?.cny ?? null)}
+                          {value?.partial && value.cny !== null ? " *" : ""}
+                        </td>
+                        <td className="px-4 py-3 text-caption text-fg-3">
+                          {formatAnalyticsTimestamp(
+                            account.lastSyncAt,
+                            locale,
+                          ) ?? "—"}
+                          {account.lastError && (
+                            <p className="mt-1 max-w-[250px] whitespace-normal text-warning-text">
+                              {account.lastError}
+                            </p>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                {tab === "models" &&
+                  Object.entries(report.byModel).map(([label, value]) => (
+                    <tr key={label} className="hover:bg-subtle/40">
+                      <td className="px-4 py-3 font-mono text-caption text-fg-1">
+                        {label || tx("notReported", "Not reported")}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-2">
+                        {count(value.requests)}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-1">
+                        {count(value.measuredTokens)}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-2">
+                        {percent(value.cacheHitRate)}
+                      </td>
+                      <td className="px-4 py-3 font-medium tabular-nums text-fg-1">
+                        {money(value.cny)}
+                        {value.partial && value.cny !== null ? " *" : ""}
+                      </td>
+                    </tr>
                   ))}
-                </ul>
-              ) : (
-                <p className="mt-3 text-caption text-fg-3">
-                  {tx("noSyncHistory", "No synchronization has completed yet.")}
-                </p>
+                {tab === "details" &&
+                  detailRows.map((item) => (
+                    <tr key={item.key} className="hover:bg-subtle/40">
+                      <td className="px-4 py-3 tabular-nums text-fg-1">
+                        {item.bucket.day ?? "—"}
+                      </td>
+                      <td className="px-4 py-3 text-fg-2">
+                        {accounts.find(
+                          (account) => account.id === item.bucket.accountId,
+                        )?.name ?? item.bucket.accountId}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-caption text-fg-2">
+                        {item.bucket.model ?? tx("notReported", "Not reported")}
+                      </td>
+                      <td className="px-4 py-3 text-caption text-fg-3">
+                        {item.bucket.granularity === "day"
+                          ? tx("dailyAggregate", "Daily aggregate")
+                          : item.bucket.granularity === "event"
+                            ? tx("eventAggregate", "Reported event aggregate")
+                            : tx("lifetimeAggregate", "Lifetime snapshot")}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-2">
+                        {count(item.estimate.requests)}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-1">
+                        {count(item.estimate.measuredTokens)}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-fg-2">
+                        {count(metricOf(item.bucket, ["cache_read_tokens"]))}
+                      </td>
+                      <td className="px-4 py-3 font-medium tabular-nums text-fg-1">
+                        {money(item.estimate.cny)}
+                        {item.estimate.partial && item.estimate.cny !== null
+                          ? " *"
+                          : ""}
+                      </td>
+                    </tr>
+                  ))}
+                {((tab === "accounts" && !selectedAccounts.length) ||
+                  (tab === "models" && !Object.keys(report.byModel).length) ||
+                  (tab === "details" && !report.buckets.length)) && (
+                  <tr>
+                    <td
+                      colSpan={8}
+                      className="px-4 py-10 text-center text-caption text-fg-3"
+                    >
+                      {tx(
+                        "noReturnedRecords",
+                        "No records have been returned for this selection.",
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-2 text-caption text-fg-3">
+            <span>
+              {tx(
+                "dailyDetailNotice",
+                "These are reported usage aggregates, not individual request logs. Missing values are unavailable.",
               )}
-            </section>
-          </>
-        )}
+            </span>
+            {tab === "details" && report.buckets.length > 30 && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="quiet"
+                  size="compact"
+                  disabled={detailPage === 0}
+                  onClick={() => setDetailPage((page) => page - 1)}
+                >
+                  {tx("previous", "Previous")}
+                </Button>
+                <span>
+                  {detailPage + 1} / {Math.ceil(report.buckets.length / 30)}
+                </span>
+                <Button
+                  variant="quiet"
+                  size="compact"
+                  disabled={(detailPage + 1) * 30 >= report.buckets.length}
+                  onClick={() => setDetailPage((page) => page + 1)}
+                >
+                  {tx("next", "Next")}
+                </Button>
+              </div>
+            )}
+          </div>
+        </section>
+        <p className="text-caption text-fg-3">
+          {tx(
+            "compactCoverage",
+            "Official account data has partial Chat coverage. Model, request, cache, or feature breakdowns appear only when actually reported. Different sources and coverage scopes remain separate.",
+          )}
+        </p>
       </div>
-
+      <Dialog open={manageOpen} onOpenChange={setManageOpen}>
+        <DialogContent className="max-w-[1100px]">
+          <DialogHeader>
+            <DialogTitle>{tx("manageAccounts", "Manage accounts")}</DialogTitle>
+            <DialogDescription>
+              {tx(
+                "existingSessionsNotice",
+                "Existing accounts stay signed in; analytics links reuse CC Switch-managed sessions. Sync may refresh an existing session normally.",
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-control bg-subtle p-3">
+              <label className="flex items-center gap-2 text-body text-fg-2">
+                <Switch
+                  checked={autoRefresh}
+                  onCheckedChange={(enabled) => {
+                    setAutoRefresh(enabled);
+                    try {
+                      localStorage.setItem(
+                        "cc-switch.unified-usage.autoRefresh",
+                        enabled ? "1" : "0",
+                      );
+                    } catch {}
+                  }}
+                />
+                {tx("autoRefreshAll", "Auto-refresh all connected accounts")}
+              </label>
+              <select
+                aria-label={tx("refreshFrequency", "Refresh frequency")}
+                className={SELECT}
+                value={autoRefreshMs}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setAutoRefreshMs(value);
+                  try {
+                    localStorage.setItem(
+                      "cc-switch.unified-usage.autoRefreshMs",
+                      String(value),
+                    );
+                  } catch {}
+                }}
+              >
+                <option value={60000}>
+                  {tx("everyMinute", "Every minute")}
+                </option>
+                <option value={120000}>
+                  {tx("everyTwoMinutes", "Every 2 minutes")}
+                </option>
+                <option value={300000}>
+                  {tx("everyFiveMinutes", "Every 5 minutes")}
+                </option>
+              </select>
+            </div>
+            <p className="text-caption text-fg-3">
+              {tx(
+                "autoRefreshScope",
+                "Refresh is enabled by default while this page is open, visible, and focused. It always covers all connected accounts, independently of display filters.",
+              )}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="neutral"
+                size="compact"
+                disabled={busy}
+                onClick={() => editAccount("new")}
+              >
+                <Plus className="h-3.5 w-3.5" />
+                {tx("addAccount", "Add account")}
+              </Button>
+              <Button
+                variant="neutral"
+                size="compact"
+                disabled={busy}
+                onClick={() => void importExistingAccounts()}
+              >
+                <Link2 className="h-3.5 w-3.5" />
+                {tx(
+                  "importExistingAccounts",
+                  "Import existing ChatGPT accounts",
+                )}
+              </Button>
+              <Button
+                variant="quiet"
+                size="compact"
+                disabled={busy}
+                onClick={prepareImport}
+              >
+                <Upload className="h-3.5 w-3.5" />
+                {tx("import", "Import")}
+              </Button>
+              <Button
+                variant="quiet"
+                size="compact"
+                disabled={busy}
+                onClick={() => void exportRecords()}
+              >
+                <Download className="h-3.5 w-3.5" />
+                {tx("export", "Export")}
+              </Button>
+              <Button
+                variant="quiet"
+                size="compact"
+                onClick={() => void pricing.refresh()}
+              >
+                {tx("refreshPricingFx", "Refresh prices and exchange rate")}
+              </Button>
+            </div>
+            <div className="flex gap-2">
+              {(["platform", "feature"] as const).map((dimension) => (
+                <select
+                  key={dimension}
+                  aria-label={tx(dimension, dimension)}
+                  className={SELECT}
+                  value={dimension === "platform" ? platform : feature}
+                  onChange={(event) =>
+                    (dimension === "platform" ? setPlatform : setFeature)(
+                      event.target.value,
+                    )
+                  }
+                >
+                  <option value="">
+                    {tx(`all_${dimension}`, `All ${dimension}s`)}
+                  </option>
+                  {dimensionOptions(dimension).map((label) => (
+                    <option key={label} value={label}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              ))}
+            </div>
+            <p className="text-caption text-fg-3">
+              {tx("fxSource", "FX source")}:{" "}
+              {pricing.fx.providerName ?? pricing.fx.source ?? "—"} · USD/CNY{" "}
+              {pricing.usdToCny ?? "—"} · {tx("fxFetchedAt", "Fetched at")}:{" "}
+              {formatAnalyticsTimestamp(pricing.fx.updatedAt, locale) ?? "—"}
+            </p>
+            {managementTable}
+            <details className="text-caption text-fg-3">
+              <summary>{tx("syncHistory", "Recent synchronization")}</summary>
+              <ul className="mt-2 space-y-1">
+                {data?.syncHistory.slice(0, 20).map((item) => (
+                  <li key={item.id}>
+                    {accounts.find((account) => account.id === item.accountId)
+                      ?.name ?? item.accountId}{" "}
+                    · {formatAnalyticsTimestamp(item.startedAt, locale)} ·{" "}
+                    {item.status}
+                    {item.error ? ` · ${item.error}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </div>
+          <DialogFooter>
+            <Button variant="neutral" onClick={() => setManageOpen(false)}>
+              {tx("done", "Done")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={editing !== null}
         onOpenChange={(isOpen) => {
@@ -1203,29 +1534,6 @@ export function UnifiedUsageDashboard({
                 autoFocus
               />
             </label>
-            {editing !== "new" && (
-              <label className="block space-y-1.5 text-body text-fg-2">
-                <span>{tx("frequency", "Automatic synchronization")}</span>
-                <select
-                  className={SELECT}
-                  value={interval}
-                  onChange={(event) => setIntervalMinutes(event.target.value)}
-                >
-                  <option value="0">{tx("manual", "Manual only")}</option>
-                  <option value="15">
-                    {tx("every15", "Every 15 minutes")}
-                  </option>
-                  <option value="60">{tx("every60", "Every hour")}</option>
-                  <option value="360">{tx("every360", "Every 6 hours")}</option>
-                </select>
-                <p className="text-caption text-fg-3">
-                  {tx(
-                    "syncVisibility",
-                    "Automatic synchronization runs only while this analytics page is open and visible.",
-                  )}
-                </p>
-              </label>
-            )}
           </div>
           <DialogFooter>
             <Button

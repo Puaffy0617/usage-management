@@ -581,6 +581,32 @@ test("release workflows isolate signing credentials and pin repository/default b
     JSON.stringify(workflow.jobs.build).includes("TAURI_SIGNING_PRIVATE_KEY"),
     false,
   );
+  const caches = Object.entries(workflow.jobs).flatMap(([job, config]) =>
+    config.steps
+      .filter((step) => step.uses?.startsWith("Swatinem/rust-cache@"))
+      .map((step) => ({ job, step })),
+  );
+  assert.equal(caches.length, 1);
+  assert.equal(caches[0].job, "build");
+  const cache = caches[0].step;
+  assert.equal(
+    cache.uses,
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+  );
+  assert.equal(cache.if, "inputs.upstream_version == ''");
+  assert.deepEqual(cache.with, {
+    workspaces: "src-tauri -> target",
+    "shared-key": "hosted-windows-msvc",
+    "cache-workspace-crates": "false",
+  });
+  assert.equal(cache.env, undefined);
+  const buildSteps = workflow.jobs.build.steps;
+  assert.ok(
+    buildSteps.indexOf(cache) >
+      buildSteps.findIndex(
+        (step) => step.uses === "dtolnay/rust-toolchain@stable",
+      ),
+  );
   const signer = workflow.jobs["sign-and-publish"];
   assert.equal(signer.permissions.contents, "write");
   assert.match(signer.if, /Puaffy0617\/usage-management/);

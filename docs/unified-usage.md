@@ -16,6 +16,8 @@ The application only shows data that these calls return. It cannot establish com
 
 See [the compatibility assessment](unified-usage-sources.md) for all requested platforms, official sources, authorization boundaries and dated research links. API organization usage and eligible workspace admin analytics are separate reporting scopes and are documented as researched but not integrated.
 
+The v2 account view adds API-equivalent CNY estimates, measured-token/request/cache cards, a UTC daily heatmap and account/model/day tables. Costs require exact model prices and explicit compatible token components; unavailable amounts stay unavailable. See [the cost and automatic-refresh guide](unified-usage-costs.md) (Chinese). These estimates are not subscription charges.
+
 ## Architecture and data integrity
 
 The frontend uses the application's React components, TanStack Query, design tokens and Recharts. `UsagePage.tsx` selects the existing device dashboard or the additive `UnifiedUsageDashboard.tsx`. `src/lib/api/unifiedUsage.ts` provides typed Tauri command calls.
@@ -28,7 +30,7 @@ Daily official buckets are snapshots, not increments. Their deterministic identi
 
 Aggregations group by source, scope, metric, unit and provenance. Only matching groups across distinct accounts are added. Official measurements, local measurements and estimates retain separate totals. Imported files retain their declared provenance; importing a file does not certify that its claims are accurate. Existing local logs cannot safely be assigned to the account currently selected, because they did not record that identity at capture time.
 
-Sync is manual by default. The header's **Sync now** refreshes every connected analytics account, including accounts not currently in use, even while a single account is selected for display. A row's refresh targets only that account. The collector never chooses the current provider or the ordinary Codex login. An account may opt into a configurable interval while the analytics view is open; this also considers every eligible profile independently of the display filter. Transient failures retry at that configured interval, while expired authorization requires reconnecting.
+Automatic sync is enabled by default every two minutes while the analytics page is open, visible and focused. Account management can disable it or choose a one-, two- or five-minute interval. The header's **Sync now** refreshes every connected analytics account, including accounts not currently in use, even while a single account is selected for display. A row's refresh targets only that account. Both automatic and global manual refresh consider every eligible profile independently of the display filter. The collector never chooses the current provider or the ordinary Codex login. Transient failures retry at the configured interval, while expired authorization requires reconnecting.
 
 Accounts fail independently; a failure preserves existing historical records and records its status. No persistent background daemon or unrestricted polling is introduced. Interrupted sync runs are marked on database startup. Quota snapshots show their capture time and must not be read as a guaranteed current allowance after a disconnect.
 

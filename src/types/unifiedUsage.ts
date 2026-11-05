@@ -62,6 +62,29 @@ export interface AnalyticsDashboard {
   breakdowns: AnalyticsBreakdown[];
   recordCount: number;
   syncHistory: AnalyticsSyncRun[];
+  /** Complete filtered dimension intersections; older fixtures may omit it. */
+  usageBuckets?: UsageBucket[];
+}
+
+export interface UsageBucketMetric {
+  metric: string;
+  unit: string;
+  value: number;
+}
+
+export interface UsageBucket {
+  accountId: string;
+  source: string;
+  scope: string;
+  provenance: string;
+  granularity: "day" | "event" | "lifetime";
+  /** UTC date; null is reserved for genuinely reported lifetime-only sources. */
+  day: string | null;
+  model: string | null;
+  platform: string | null;
+  feature: string | null;
+  /** Omitted components stay unavailable; generic input_tokens is ambiguous. */
+  metrics: UsageBucketMetric[];
 }
 
 export interface AnalyticsLogin {

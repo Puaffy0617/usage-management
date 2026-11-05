@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub const MAX_IMPORT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SAFE_VALUE: f64 = 9_007_199_254_740_991.0;
@@ -138,6 +138,61 @@ pub struct UsageBreakdown {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageBucketMetric {
+    pub metric: String,
+    pub unit: String,
+    pub value: f64,
+}
+
+/// A measured intersection of dimensions, without inferred request counters,
+/// model attribution, cache semantics or lifetime/day equivalence.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBucket {
+    pub account_id: String,
+    pub source: String,
+    pub scope: String,
+    pub provenance: String,
+    pub granularity: String,
+    pub day: Option<String>,
+    pub model: Option<String>,
+    pub platform: Option<String>,
+    pub feature: Option<String>,
+    pub metrics: Vec<UsageBucketMetric>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UsageBucketKey {
+    account_id: String,
+    source: String,
+    scope: String,
+    provenance: String,
+    granularity: String,
+    day: String,
+    model: String,
+    platform: String,
+    feature: String,
+}
+
+impl UsageBucketKey {
+    fn into_bucket(self) -> UsageBucket {
+        let present = |value: String| (!value.is_empty()).then_some(value);
+        UsageBucket {
+            account_id: self.account_id,
+            source: self.source,
+            scope: self.scope,
+            provenance: self.provenance,
+            granularity: self.granularity,
+            day: Some(self.day),
+            model: present(self.model),
+            platform: present(self.platform),
+            feature: present(self.feature),
+            metrics: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SyncRun {
@@ -160,6 +215,7 @@ pub struct AnalyticsDashboard {
     pub breakdowns: Vec<UsageBreakdown>,
     pub record_count: u64,
     pub sync_history: Vec<SyncRun>,
+    pub usage_buckets: Vec<UsageBucket>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -485,11 +541,11 @@ fn observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageObservation
     })
 }
 
-fn metric_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricAggregate> {
-    let value: f64 = row.get(6)?;
+fn checked_aggregate_value(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<f64> {
+    let value: f64 = row.get(index)?;
     if !value.is_finite() || value > MAX_SAFE_VALUE {
         return Err(rusqlite::Error::FromSqlConversionFailure(
-            6,
+            index,
             rusqlite::types::Type::Real,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -497,6 +553,10 @@ fn metric_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricAggregate> {
             )),
         ));
     }
+    Ok(value)
+}
+
+fn metric_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricAggregate> {
     Ok(MetricAggregate {
         account_id: row.get(0)?,
         source: row.get(1)?,
@@ -504,7 +564,7 @@ fn metric_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricAggregate> {
         metric: row.get(3)?,
         unit: row.get(4)?,
         provenance: row.get(5)?,
-        value,
+        value: checked_aggregate_value(row, 6)?,
     })
 }
 
@@ -948,6 +1008,45 @@ impl Database {
         let sync_history = stmt
             .query_map([], sync_row)?
             .collect::<Result<Vec<_>, _>>()?;
+        // Keep date/model/platform/feature intersections rather than attempting
+        // to reconstruct them from independent marginal breakdown totals. This
+        // scans the complete selected coverage and never silently truncates it.
+        let bucket_columns =
+            "account_id,source,scope,provenance,granularity,period_start,model,platform,feature";
+        let mut stmt=conn.prepare(&format!("SELECT {bucket_columns},metric,unit,SUM(value) FROM unified_usage_observations {where_sql} GROUP BY {bucket_columns},metric,unit ORDER BY period_start,account_id,source,scope,provenance,granularity,model,platform,feature,metric,unit"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((
+                UsageBucketKey {
+                    account_id: row.get(0)?,
+                    source: row.get(1)?,
+                    scope: row.get(2)?,
+                    provenance: row.get(3)?,
+                    granularity: row.get(4)?,
+                    day: row.get(5)?,
+                    model: row.get(6)?,
+                    platform: row.get(7)?,
+                    feature: row.get(8)?,
+                },
+                UsageBucketMetric {
+                    metric: row.get(9)?,
+                    unit: row.get(10)?,
+                    value: checked_aggregate_value(row, 11)?,
+                },
+            ))
+        })?;
+        let mut buckets: BTreeMap<UsageBucketKey, Vec<UsageBucketMetric>> = BTreeMap::new();
+        for row in rows {
+            let (key, metric) = row?;
+            buckets.entry(key).or_default().push(metric);
+        }
+        let usage_buckets = buckets
+            .into_iter()
+            .map(|(key, metrics)| {
+                let mut bucket = key.into_bucket();
+                bucket.metrics = metrics;
+                bucket
+            })
+            .collect();
         Ok(AnalyticsDashboard {
             accounts,
             totals,
@@ -955,6 +1054,7 @@ impl Database {
             breakdowns,
             record_count,
             sync_history,
+            usage_buckets,
         })
     }
 
@@ -1322,6 +1422,286 @@ mod tests {
             db.unified_usage_dashboard(&AnalyticsFilter::default())?
                 .record_count,
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_buckets_preserve_date_model_dimensions_provenance_granularity_and_units(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let a = db.unified_usage_add_account("A")?;
+        let b = db.unified_usage_add_account("B")?;
+        let make = |account: &str,
+                    date: &str,
+                    model: &str,
+                    platform: &str,
+                    feature: &str,
+                    metric: &str,
+                    unit: &str,
+                    value: f64|
+         -> UsageObservation {
+            let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            UsageObservation {
+                account_id: account.into(),
+                source: "imported_usage".into(),
+                scope: "imported:measured".into(),
+                metric: metric.into(),
+                unit: unit.into(),
+                provenance: "local".into(),
+                period_start: date.into(),
+                period_end: day.succ_opt().unwrap().format("%Y-%m-%d").to_string(),
+                granularity: "day".into(),
+                value,
+                model: Some(model.into()),
+                platform: Some(platform.into()),
+                feature: Some(feature.into()),
+                event_id: None,
+                observed_at: Utc::now().timestamp_millis(),
+            }
+        };
+        let mut rows = vec![
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "input_tokens_fresh",
+                "tokens",
+                100.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "output_tokens",
+                "tokens",
+                40.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "cache_read_tokens",
+                "tokens",
+                0.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "requests",
+                "requests",
+                2.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "input_tokens_fresh",
+                "messages",
+                2.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-02",
+                "model-one",
+                "desktop",
+                "chat",
+                "input_tokens_fresh",
+                "tokens",
+                200.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-two",
+                "web",
+                "chat",
+                "input_tokens_fresh",
+                "tokens",
+                300.0,
+            ),
+            make(
+                &a.id,
+                "2026-11-01",
+                "model-one",
+                "mobile",
+                "image",
+                "input_tokens_fresh",
+                "tokens",
+                25.0,
+            ),
+        ];
+        let mut estimated = make(
+            &a.id,
+            "2026-11-01",
+            "model-one",
+            "web",
+            "chat",
+            "input_tokens_fresh",
+            "tokens",
+            777.0,
+        );
+        estimated.provenance = "estimated".into();
+        rows.push(estimated);
+        let mut event = make(
+            &a.id,
+            "2026-11-03",
+            "model-one",
+            "web",
+            "chat",
+            "input_tokens_fresh",
+            "tokens",
+            9.0,
+        );
+        event.granularity = "event".into();
+        event.event_id = Some("measured-turn".into());
+        rows.push(event);
+        db.unified_usage_import_observations(&a.id, &rows)?;
+        db.unified_usage_import_observations(
+            &b.id,
+            &[make(
+                &b.id,
+                "2026-11-01",
+                "model-one",
+                "web",
+                "chat",
+                "input_tokens_fresh",
+                "tokens",
+                400.0,
+            )],
+        )?;
+        db.unified_usage_apply_official(&a.id, Some(&official(&a.id, "2026-11-01", 999)), None)?;
+        let all = db.unified_usage_dashboard(&AnalyticsFilter::default())?;
+        assert!(all
+            .usage_buckets
+            .iter()
+            .all(|bucket| bucket.day.is_some() && bucket.granularity != "lifetime"));
+        let official = all
+            .usage_buckets
+            .iter()
+            .find(|bucket| bucket.source == "codex_app_server")
+            .unwrap();
+        assert!(official.model.is_none());
+        assert_eq!(official.metrics.len(), 1);
+        assert_eq!(official.metrics[0].metric, "tokens");
+        assert_eq!(official.metrics[0].value, 999.0);
+        assert!(!official
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == "requests"));
+        assert!(all
+            .usage_buckets
+            .iter()
+            .any(|bucket| bucket.granularity == "event"
+                && bucket.day.as_deref() == Some("2026-11-03")
+                && bucket.metrics[0].value == 9.0));
+        assert!(all
+            .usage_buckets
+            .iter()
+            .any(|bucket| bucket.provenance == "estimated" && bucket.metrics[0].value == 777.0));
+        assert!(all
+            .usage_buckets
+            .iter()
+            .any(|bucket| bucket.account_id == b.id && bucket.metrics[0].value == 400.0));
+        assert!(all
+            .usage_buckets
+            .iter()
+            .any(|bucket| bucket.day.as_deref() == Some("2026-11-02")
+                && bucket.model.as_deref() == Some("model-one")
+                && bucket.metrics[0].value == 200.0));
+        let filter = AnalyticsFilter {
+            start_date: Some("2026-11-01".into()),
+            end_date: Some("2026-11-01".into()),
+            account_ids: Some(vec![a.id]),
+            model: Some("model-one".into()),
+            platform: Some("web".into()),
+            feature: Some("chat".into()),
+            provenance: Some("local".into()),
+        };
+        let selected = db.unified_usage_dashboard(&filter)?;
+        assert_eq!(selected.usage_buckets.len(), 1);
+        let bucket = &selected.usage_buckets[0];
+        assert_eq!(bucket.metrics.len(), 5);
+        assert!(bucket
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == "input_tokens_fresh"
+                && metric.unit == "tokens"
+                && metric.value == 100.0));
+        assert!(bucket
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == "input_tokens_fresh"
+                && metric.unit == "messages"
+                && metric.value == 2.0));
+        assert!(bucket
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == "cache_read_tokens" && metric.value == 0.0));
+        assert!(!bucket
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == "cache_creation_tokens"));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_buckets_cover_full_history_without_a_silent_row_cap() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let account = db.unified_usage_add_account("Full history")?;
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let now = Utc::now().timestamp_millis();
+        let mut rows = Vec::new();
+        for offset in 0..372 {
+            let day = start + chrono::Duration::days(offset);
+            for (metric, value) in [("input_tokens_total", 10.0), ("output_tokens", 5.0)] {
+                rows.push(UsageObservation {
+                    account_id: account.id.clone(),
+                    source: "imported_usage".into(),
+                    scope: "imported:full-range".into(),
+                    metric: metric.into(),
+                    unit: "tokens".into(),
+                    provenance: "local".into(),
+                    period_start: day.format("%Y-%m-%d").to_string(),
+                    period_end: day.succ_opt().unwrap().format("%Y-%m-%d").to_string(),
+                    granularity: "day".into(),
+                    value,
+                    model: Some("reported-model".into()),
+                    platform: None,
+                    feature: None,
+                    event_id: None,
+                    observed_at: now,
+                });
+            }
+        }
+        db.unified_usage_import_observations(&account.id, &rows)?;
+        let complete = db.unified_usage_dashboard(&AnalyticsFilter::default())?;
+        assert_eq!(complete.usage_buckets.len(), 372);
+        assert_eq!(complete.record_count, 744);
+        assert!(complete
+            .usage_buckets
+            .iter()
+            .all(|bucket| bucket.metrics.len() == 2
+                && bucket.model.as_deref() == Some("reported-model")));
+        let january = AnalyticsFilter {
+            start_date: Some("2025-01-01".into()),
+            end_date: Some("2025-01-31".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.unified_usage_dashboard(&january)?.usage_buckets.len(),
+            31
         );
         Ok(())
     }

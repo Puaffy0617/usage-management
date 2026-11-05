@@ -1,5 +1,28 @@
 import type { DailyAggregate, MetricAggregate } from "@/types/unifiedUsage";
 
+/** Display a known sub-cent estimate without presenting it as free usage. */
+export function formatApiEquivalentCny(
+  value: number | null,
+  locale: string,
+): string {
+  if (
+    value === null ||
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > Number.MAX_SAFE_INTEGER
+  )
+    return "—";
+  const format = new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency: "CNY",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return value > 0 && value < 0.01
+    ? `<${format.format(0.01)}`
+    : format.format(value);
+}
+
 /** Only identical scopes and metric definitions may share a total or chart. */
 export function metricGroupKey(row: MetricAggregate): string {
   return JSON.stringify([

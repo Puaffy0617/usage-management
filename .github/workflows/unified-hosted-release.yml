@@ -53,6 +53,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+      - name: Cache bootstrap Rust dependencies
+        if: inputs.upstream_version == ''
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: hosted-windows-msvc
+          cache-workspace-crates: "false"
       - name: Install source dependencies without signing credentials
         run: |
           corepack enable
